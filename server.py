@@ -4,7 +4,10 @@ import json
 import random
 import os
 import socket
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
+# -----------------------------
 devices = {}
 paired_devices = set()
 
@@ -53,17 +56,14 @@ async def handler(ws):
             data = json.loads(msg)
             msg_type = data.get("type")
 
-            # ---------------- PC ----------------
             if msg_type == "register":
                 device_id = data["device_id"]
                 devices[device_id] = ws
                 print(f"[PC ONLINE] {device_id}")
 
-            # ---------------- MOBILE ----------------
             elif msg_type == "register_mobile":
                 print("[MOBILE CONNECTED]")
 
-            # ---------------- PAIRING ----------------
             elif msg_type == "request_pair":
                 code = gen_code()
 
@@ -89,7 +89,6 @@ async def handler(ws):
 
                     print(f"[PAIRED] {dev}")
 
-            # ---------------- COMMANDS ----------------
             elif msg_type == "shutdown_pc":
                 await send_to_device(data.get("device_id"), {
                     "type": "shutdown_pc",
@@ -120,10 +119,26 @@ async def handler(ws):
             print(f"[DISCONNECTED] {device_id}")
 
 # -----------------------------
+def run_http():
+    class SimpleHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"Server is running")
+
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), SimpleHandler)
+    server.serve_forever()
+
+# -----------------------------
 async def main():
     load_pairs()
+
+    # start HTTP server FIRST
+    threading.Thread(target=run_http, daemon=True).start()
+
     server = await websockets.serve(handler, "0.0.0.0", 8000)
-    print("[SERVER RUNNING]")
+    print("[WS SERVER RUNNING]")
     await asyncio.Future()
 
 asyncio.run(main())
