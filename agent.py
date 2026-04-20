@@ -5,14 +5,11 @@ import uuid
 import time
 import os
 import socket
-import sys
 
 SERVER_URL = "ws://192.168.1.230:8000"
 DEVICE_ID_FILE = "device_id.txt"
 
 TARGET_MAC = "3C:6A:D2:41:58:F9"
-
-ws_global = None
 
 # -----------------------------
 def get_device_id():
@@ -48,23 +45,26 @@ def wake_on_lan(mac):
 
 # -----------------------------
 async def send_heartbeat(ws):
+    print("[HEARTBEAT STARTED]")
+
     while True:
         try:
-            print("[HEARTBEAT SENT]")
             await ws.send(json.dumps({
                 "type": "heartbeat",
                 "device_id": DEVICE_ID,
                 "timestamp": time.time()
             }))
+
+            print("[HEARTBEAT SENT]")
+
             await asyncio.sleep(10)
+
         except Exception as e:
-            print("[HEARTBEAT ERROR]", e)
+            print("[HEARTBEAT FAILED]", e)
             break
 
 # -----------------------------
-async def handle_command(cmd):
-    global ws_global
-
+async def handle_command(cmd, ws):
     t = cmd.get("type")
     cmd_id = cmd.get("command_id")
 
@@ -86,8 +86,8 @@ async def handle_command(cmd):
         elif t == "reload_agent":
             os._exit(0)
 
-        if cmd_id and ws_global:
-            await ws_global.send(json.dumps({
+        if cmd_id:
+            await ws.send(json.dumps({
                 "type": "ack",
                 "command_id": cmd_id,
                 "status": "executed"
@@ -98,15 +98,11 @@ async def handle_command(cmd):
 
 # -----------------------------
 async def connect():
-    global ws_global
-
     print(f"[START] {DEVICE_ID}")
 
     while True:
         try:
             async with websockets.connect(SERVER_URL) as ws:
-                ws_global = ws
-
                 print("[SOCKET OPENED]")
 
                 await ws.send(json.dumps({
@@ -116,16 +112,18 @@ async def connect():
 
                 print("[REGISTER SENT]")
 
-                asyncio.create_task(send_heartbeat(ws))
+                # ✅ IMPORTANT: restart heartbeat every connection
+                heartbeat_task = asyncio.create_task(send_heartbeat(ws))
 
                 while True:
                     msg = await ws.recv()
                     cmd = json.loads(msg)
-                    await handle_command(cmd)
+                    await handle_command(cmd, ws)
 
         except Exception as e:
             print(f"[DISCONNECTED] retrying... {e}")
             await asyncio.sleep(3)
 
+# -----------------------------
 if __name__ == "__main__":
     asyncio.run(connect())

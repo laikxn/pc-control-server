@@ -145,10 +145,22 @@ async def handler(ws):
 
             # ---------------- HEARTBEAT ----------------
             elif msg_type == "heartbeat":
-                dev = data.get("device_id")
+    dev = data.get("device_id")
 
-                if dev in devices:
-                    device_last_seen[dev] = time.time()
+    if dev in devices:
+        device_last_seen[dev] = time.time()
+
+        # 🔥 NEW: tell dashboard it's still alive
+        for client_set in [mobile_clients, dashboard_clients]:
+            for c in list(client_set):
+                try:
+                    await c.send(json.dumps({
+                        "type": "pc_activity",
+                        "device_id": dev,
+                        "last_seen": device_last_seen[dev]
+                    }))
+                except:
+                    client_set.discard(c)
 
                     # recover if offline
                     if device_status.get(dev) != "online":
