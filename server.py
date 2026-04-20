@@ -17,7 +17,7 @@ dashboard_clients = set()
 
 paired_devices = set()
 device_last_seen = {}
-device_status = {}  # NEW
+device_status = {}
 
 pending_acks = {}
 
@@ -69,6 +69,21 @@ async def broadcast_status(device_id, status):
                 client_set.discard(c)
 
 # -----------------------------
+async def broadcast_activity(device_id):
+    payload = json.dumps({
+        "type": "pc_activity",
+        "device_id": device_id,
+        "last_seen": device_last_seen.get(device_id, time.time())
+    })
+
+    for client_set in [mobile_clients, dashboard_clients]:
+        for c in list(client_set):
+            try:
+                await c.send(payload)
+            except:
+                client_set.discard(c)
+
+# -----------------------------
 async def send_to_device(device_id, payload):
     ws = devices.get(device_id)
     if not ws:
@@ -76,7 +91,6 @@ async def send_to_device(device_id, payload):
 
     try:
         command_id = str(random.randint(100000, 999999))
-
         payload["command_id"] = command_id
 
         pending_acks[command_id] = {
@@ -120,7 +134,6 @@ async def handler(ws):
 
                 print("[MOBILE CONNECTED]")
 
-                # send snapshot
                 for dev in device_status:
                     await ws.send(json.dumps({
                         "type": "pc_status",
@@ -135,7 +148,6 @@ async def handler(ws):
 
                 print("[DASHBOARD CONNECTED]")
 
-                # send snapshot
                 for dev in device_status:
                     await ws.send(json.dumps({
                         "type": "pc_status",
@@ -145,35 +157,22 @@ async def handler(ws):
 
             # ---------------- HEARTBEAT ----------------
             elif msg_type == "heartbeat":
-    dev = data.get("device_id")
+                dev = data.get("device_id")
 
-    if dev in devices:
-        device_last_seen[dev] = time.time()
+                if dev in devices:
+                    device_last_seen[dev] = time.time()
 
-        # 🔥 NEW: tell dashboard it's still alive
-        for client_set in [mobile_clients, dashboard_clients]:
-            for c in list(client_set):
-                try:
-                    await c.send(json.dumps({
-                        "type": "pc_activity",
-                        "device_id": dev,
-                        "last_seen": device_last_seen[dev]
-                    }))
-                except:
-                    client_set.discard(c)
+                    # keep alive update
+                    await broadcast_activity(dev)
 
-                    # recover if offline
+                    # recover from offline
                     if device_status.get(dev) != "online":
                         device_status[dev] = "online"
                         print(f"[RECOVERED] {dev}")
                         await broadcast_status(dev, "online")
 
-            # ---------------- ANY PC MESSAGE = ACTIVITY ----------------
-            if client_type == "pc" and device_id:
-                device_last_seen[device_id] = time.time()
-
             # ---------------- COMMANDS ----------------
-            if msg_type in ["shutdown_pc", "restart_pc", "lock_pc"]:
+            elif msg_type in ["shutdown_pc", "restart_pc", "lock_pc"]:
                 print(f"[COMMAND RECEIVED] {msg_type}")
 
                 await send_to_device(data.get("device_id"), {
@@ -229,5 +228,6 @@ async def main():
         asyncio.create_task(cleanup_loop())
         await asyncio.Future()
 
+# -----------------------------
 if __name__ == "__main__":
     asyncio.run(main())
