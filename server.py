@@ -10,37 +10,34 @@ import logging
 logging.getLogger("websockets").setLevel(logging.ERROR)
 
 # -----------------------------
-devices = {}
+devices = {}  # device_id -> ws
+device_last_seen = {}
+device_status = {}  # device_id -> "online"/"offline"
+
 mobile_clients = set()
 dashboard_clients = set()
-
-device_last_seen = {}
-device_disconnect_time = {}
-device_status = {}
 
 pending_acks = {}
 
 PAIR_FILE = "paired.json"
 pair_codes = {}
 
-OFFLINE_THRESHOLD = 25        # heartbeat timeout
-RECONNECT_GRACE = 8          # NEW: prevents flicker
+OFFLINE_THRESHOLD = 20
 
 # -----------------------------
-def broadcast(msg):
-    async def _send():
-        payload = json.dumps(msg)
-        targets = list(mobile_clients) + list(dashboard_clients)
+def load_pairs():
+    global paired_devices
+    if os.path.exists(PAIR_FILE):
+        with open(PAIR_FILE, "r") as f:
+            return set(json.load(f))
+    return set()
 
-        for c in targets:
-            try:
-                await c.send(payload)
-            except:
-                pass
+paired_devices = load_pairs()
 
-    asyncio.create_task(_send())
+def save_pairs():
+    with open(PAIR_FILE, "w") as f:
+        json.dump(list(paired_devices), f)
 
-# -----------------------------
 def gen_code():
     return str(random.randint(100000, 999999))
 
@@ -58,16 +55,50 @@ def send_wol():
     print("[WOL SENT]")
 
 # -----------------------------
+async def broadcast(event):
+    msg = json.dumps(event)
+
+    targets = list(mobile_clients) + list(dashboard_clients)
+
+    for c in targets:
+        try:
+            await c.send(msg)
+        except:
+            mobile_clients.discard(c)
+            dashboard_clients.discard(c)
+
+# -----------------------------
+async def set_status(device_id, status):
+    device_status[device_id] = status
+
+    await broadcast({
+        "type": "device_update",
+        "device_id": device_id,
+        "status": status,
+        "last_seen": device_last_seen.get(device_id, time.time())
+    })
+
+# -----------------------------
 async def send_to_device(device_id, payload):
     ws = devices.get(device_id)
     if not ws:
         return
 
     try:
+        cmd_id = str(random.randint(100000, 999999))
+        payload["command_id"] = cmd_id
+
+        pending_acks[cmd_id] = {
+            "device_id": device_id,
+            "type": payload["type"],
+            "time": time.time()
+        }
+
         await ws.send(json.dumps(payload))
         print(f"[SEND → {device_id}] {payload['type']}")
-    except:
-        pass
+
+    except Exception as e:
+        print("[SEND ERROR]", e)
 
 # -----------------------------
 async def handler(ws):
@@ -79,7 +110,7 @@ async def handler(ws):
             data = json.loads(msg)
             msg_type = data.get("type")
 
-            # ---------------- PC REGISTER ----------------
+            # ---------------- PC ----------------
             if msg_type == "register":
                 device_id = data["device_id"]
                 client_type = "pc"
@@ -87,45 +118,52 @@ async def handler(ws):
                 devices[device_id] = ws
                 device_last_seen[device_id] = time.time()
 
-                # cancel pending offline if reconnect fast
-                device_disconnect_time.pop(device_id, None)
-
-                device_status[device_id] = "online"
+                await set_status(device_id, "online")
 
                 print(f"[PC ONLINE] {device_id}")
 
-                broadcast({
-                    "type": "pc_status",
-                    "status": "online",
-                    "device_id": device_id
-                })
+                # full snapshot
+                await ws.send(json.dumps({
+                    "type": "device_snapshot",
+                    "devices": device_status
+                }))
 
             # ---------------- MOBILE ----------------
             elif msg_type == "register_mobile":
                 client_type = "mobile"
                 mobile_clients.add(ws)
+
                 print("[MOBILE CONNECTED]")
+
+                await ws.send(json.dumps({
+                    "type": "device_snapshot",
+                    "devices": device_status
+                }))
 
             # ---------------- DASHBOARD ----------------
             elif msg_type == "register_dashboard":
                 client_type = "dashboard"
                 dashboard_clients.add(ws)
+
                 print("[DASHBOARD CONNECTED]")
+
+                await ws.send(json.dumps({
+                    "type": "device_snapshot",
+                    "devices": device_status
+                }))
 
             # ---------------- HEARTBEAT ----------------
             elif msg_type == "heartbeat":
                 dev = data.get("device_id")
+
                 if dev in devices:
                     device_last_seen[dev] = time.time()
 
-                    if device_status.get(dev) != "online":
-                        device_status[dev] = "online"
-
-                        broadcast({
-                            "type": "pc_status",
-                            "status": "online",
-                            "device_id": dev
-                        })
+                    await broadcast({
+                        "type": "device_heartbeat",
+                        "device_id": dev,
+                        "last_seen": device_last_seen[dev]
+                    })
 
             # ---------------- COMMANDS ----------------
             elif msg_type in ["shutdown_pc", "restart_pc", "lock_pc"]:
@@ -141,58 +179,40 @@ async def handler(ws):
         print("[WS ERROR]", e)
 
     finally:
-        # ---------------- PC DISCONNECT ----------------
         if client_type == "pc" and device_id:
+            devices.pop(device_id, None)
+            device_last_seen.pop(device_id, None)
 
-            # mark disconnect time instead of instantly offline
-            device_disconnect_time[device_id] = time.time()
-
+            await set_status(device_id, "offline")
             print(f"[PC DISCONNECTED] {device_id}")
 
-        # ---------------- MOBILE ----------------
-        elif client_type == "mobile":
+        if client_type == "mobile":
             mobile_clients.discard(ws)
+            print("[MOBILE DISCONNECTED]")
 
-        # ---------------- DASHBOARD ----------------
-        elif client_type == "dashboard":
+        if client_type == "dashboard":
             dashboard_clients.discard(ws)
+            print("[DASHBOARD DISCONNECTED]")
 
 # -----------------------------
-async def offline_checker():
+async def cleanup_loop():
     while True:
         now = time.time()
 
-        for dev in list(devices.keys()):
-
-            last_seen = device_last_seen.get(dev, 0)
-            last_dc = device_disconnect_time.get(dev)
-
-            # 1. heartbeat timeout
-            if now - last_seen > OFFLINE_THRESHOLD:
-
-                # 2. grace period check
-                if last_dc and now - last_dc < RECONNECT_GRACE:
-                    continue  # ignore flicker
-
+        for dev in list(device_last_seen.keys()):
+            if now - device_last_seen[dev] > OFFLINE_THRESHOLD:
                 if device_status.get(dev) != "offline":
-                    device_status[dev] = "offline"
-
                     print(f"[OFFLINE] {dev}")
+                    await set_status(dev, "offline")
 
-                    broadcast({
-                        "type": "pc_status",
-                        "status": "offline",
-                        "device_id": dev
-                    })
-
-        await asyncio.sleep(3)
+        await asyncio.sleep(5)
 
 # -----------------------------
 async def main():
     print("[WS RUNNING] on 8000")
 
     async with websockets.serve(handler, "0.0.0.0", 8000):
-        asyncio.create_task(offline_checker())
+        asyncio.create_task(cleanup_loop())
         await asyncio.Future()
 
 if __name__ == "__main__":
