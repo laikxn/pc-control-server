@@ -67,7 +67,18 @@ async def send_to_device(device_id, payload):
 # -----------------------------
 async def handler(ws):
     device_id = None
-    is_mobile = False
+    elif msg_type == "register_mobile":
+    is_mobile = True
+    mobile_clients.add(ws)
+
+    print("[MOBILE CONNECTED]")
+
+    for dev in devices:
+        await ws.send(json.dumps({
+            "type": "pc_status",
+            "status": "online",
+            "device_id": dev
+        }))
 
     try:
         async for msg in ws:
@@ -173,6 +184,12 @@ async def handler(ws):
 
         if ws in mobile_clients:
             mobile_clients.remove(ws)
+            
+                           # cleanup mobile
+        if is_mobile:
+        if ws in mobile_clients:
+            mobile_clients.remove(ws)
+            print("[MOBILE DISCONNECTED]")
 
 # -----------------------------
 async def cleanup_loop():
