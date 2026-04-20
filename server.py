@@ -4,11 +4,11 @@ import json
 import random
 import os
 import socket
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import time
 
 devices = {}
 paired_devices = set()
+device_last_seen = {}
 
 PAIR_FILE = "paired.json"
 pair_codes = {}
@@ -41,10 +41,14 @@ def send_wol():
     print("[WOL SENT]")
 
 # -----------------------------
-async def send_to_device(target, payload):
-    if target in devices:
-        await devices[target].send(json.dumps(payload))
-        print(f"[SEND → {target}] {payload['type']}")
+async def send_to_device(device_id, payload):
+    ws = devices.get(device_id)
+    if ws:
+        try:
+            await ws.send(json.dumps(payload))
+            print(f"[SEND → {device_id}] {payload['type']}")
+        except Exception as e:
+            print("[SEND ERROR]", e)
 
 # -----------------------------
 async def handler(ws):
@@ -55,14 +59,24 @@ async def handler(ws):
             data = json.loads(msg)
             msg_type = data.get("type")
 
+            # ---------------- REGISTER PC ----------------
             if msg_type == "register":
                 device_id = data["device_id"]
                 devices[device_id] = ws
+                device_last_seen[device_id] = time.time()
                 print(f"[PC ONLINE] {device_id}")
 
+            # ---------------- HEARTBEAT ----------------
+            elif msg_type == "heartbeat":
+                dev = data.get("device_id")
+                if dev in devices:
+                    device_last_seen[dev] = time.time()
+
+            # ---------------- MOBILE ----------------
             elif msg_type == "register_mobile":
                 print("[MOBILE CONNECTED]")
 
+            # ---------------- PAIR REQUEST ----------------
             elif msg_type == "request_pair":
                 code = gen_code()
 
@@ -75,6 +89,7 @@ async def handler(ws):
                         "code": code
                     }))
 
+            # ---------------- CONFIRM PAIR ----------------
             elif msg_type == "confirm_pair":
                 code = data.get("code")
 
@@ -88,21 +103,17 @@ async def handler(ws):
 
                     print(f"[PAIRED] {dev}")
 
-            elif msg_type == "shutdown_pc":
+            # ---------------- RELOAD AGENT (NEW FEATURE) ----------------
+            elif msg_type == "reload_agent":
                 await send_to_device(data.get("device_id"), {
-                    "type": "shutdown_pc",
+                    "type": "reload_agent",
                     "data": {}
                 })
 
-            elif msg_type == "restart_pc":
+            # ---------------- COMMANDS ----------------
+            elif msg_type in ["shutdown_pc", "restart_pc", "lock_pc"]:
                 await send_to_device(data.get("device_id"), {
-                    "type": "restart_pc",
-                    "data": {}
-                })
-
-            elif msg_type == "lock_pc":
-                await send_to_device(data.get("device_id"), {
-                    "type": "lock_pc",
+                    "type": msg_type,
                     "data": {}
                 })
 
@@ -113,39 +124,39 @@ async def handler(ws):
         print("[WS ERROR]", e)
 
     finally:
-        if device_id in devices:
-            del devices[device_id]
+        if device_id:
+            devices.pop(device_id, None)
+            device_last_seen.pop(device_id, None)
             print(f"[DISCONNECTED] {device_id}")
 
 # -----------------------------
-# HTTP SERVER (Render health check fix)
-class SimpleHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
+async def cleanup_loop():
+    while True:
+        now = time.time()
+        dead = []
 
-    def do_HEAD(self):
-        self.send_response(200)
-        self.end_headers()
+        for dev, last in device_last_seen.items():
+            if now - last > 60:
+                dead.append(dev)
 
-def run_http():
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), SimpleHandler)
-    print(f"[HTTP RUNNING] on {port}")
-    server.serve_forever()
+        for d in dead:
+            print(f"[TIMEOUT] Removing {d}")
+            devices.pop(d, None)
+            device_last_seen.pop(d, None)
+
+        await asyncio.sleep(10)
 
 # -----------------------------
-async def main_ws():
+async def main():
     load_pairs()
 
     port = 8000
-    server = await websockets.serve(handler, "0.0.0.0", port)
-
     print(f"[WS RUNNING] on {port}")
-    await server.wait_closed()
+
+    async with websockets.serve(handler, "0.0.0.0", port):
+        asyncio.create_task(cleanup_loop())
+        await asyncio.Future()
 
 # -----------------------------
 if __name__ == "__main__":
-    threading.Thread(target=run_http, daemon=True).start()
-    asyncio.run(main_ws())
+    asyncio.run(main())
