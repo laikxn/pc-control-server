@@ -1,196 +1,256 @@
-import asyncio
-import websockets
-import json
-import random
-import socket
-import time
-import logging
+import React, { useEffect, useRef, useState } from "react";
 
-logging.getLogger("websockets").setLevel(logging.ERROR)
+export default function App() {
+  const wsRef = useRef(null);
 
-# -----------------------------
-devices = {}
-mobile_clients = set()
-dashboard_clients = set()
+  const [devices, setDevices] = useState({});
+  const [logs, setLogs] = useState([]);
 
-device_last_seen = {}
-device_status = {}
+  const SERVER_URL = "ws://192.168.1.230:8000";
 
-pending_acks = {}
+  // -----------------------------
+  const upsertDevice = (id, data) => {
+    if (!id) return;
 
-IDLE_THRESHOLD = 10
-OFFLINE_THRESHOLD = 25
+    setDevices((prev) => {
+      const existing = prev[id] || {};
 
-# -----------------------------
-def now():
-    return time.time()
+      return {
+        ...prev,
+        [id]: {
+          id,
+          status: data.status ?? existing.status ?? "unknown",
+          lastSeen: data.lastSeen ?? existing.lastSeen ?? Date.now(),
+        },
+      };
+    });
+  };
 
-def gen_code():
-    return str(random.randint(100000, 999999))
+  // -----------------------------
+  // 🔥 LOG FORMATTER ADDED (FIX)
+  const formatLog = (msg) => {
+    if (!msg) return "unknown";
 
-# -----------------------------
-def send_wol():
-    TARGET_MAC = "3C:6A:D2:41:58:F9"
-    mac_bytes = bytes.fromhex(TARGET_MAC.replace(":", ""))
-    packet = b"\xff" * 6 + mac_bytes * 16
-
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        s.sendto(packet, ("255.255.255.255", 9))
-
-    print("[WOL SENT]")
-
-# -----------------------------
-async def send_log(event, data=None):
-    """REAL-TIME LOG STREAM"""
-    payload = {
-        "type": "server_log",
-        "event": event,
-        "data": data or {},
-        "time": time.strftime("%H:%M:%S")
+    // structured server logs
+    if (msg.type === "server_log") {
+      const event = msg.event || "EVENT";
+      const dev = msg.data?.device_id ? ` (${msg.data.device_id})` : "";
+      return `${event}${dev}`;
     }
 
-    msg = json.dumps(payload)
+    // pc status messages
+    if (msg.type === "pc_status") {
+      return `DEVICE ${msg.device_id} → ${msg.status}`;
+    }
 
-    for ws in list(dashboard_clients):
-        try:
-            await ws.send(msg)
-        except:
-            dashboard_clients.discard(ws)
+    // fallback
+    return typeof msg === "string" ? msg : JSON.stringify(msg);
+  };
 
-    print(f"[LOG] {event}")
+  // -----------------------------
+  const addLog = (msg) => {
+    setLogs((prev) => {
+      const next = [
+        {
+          time: new Date().toLocaleTimeString(),
+          msg: formatLog(msg), // 🔥 CHANGED HERE ONLY
+        },
+        ...prev,
+      ];
 
-# -----------------------------
-async def broadcast(payload):
-    msg = json.dumps(payload)
+      return next.slice(0, 100); // keep last 100 logs
+    });
+  };
 
-    for group in [mobile_clients, dashboard_clients]:
-        for ws in list(group):
-            try:
-                await ws.send(msg)
-            except:
-                group.discard(ws)
+  // -----------------------------
+  useEffect(() => {
+    const ws = new WebSocket(SERVER_URL);
+    wsRef.current = ws;
 
-# -----------------------------
-def calc_status(device_id):
-    last = device_last_seen.get(device_id, 0)
-    diff = now() - last
+    ws.onopen = () => {
+      addLog("Connected to server");
 
-    if device_id not in devices:
-        return "offline"
-    if diff > OFFLINE_THRESHOLD:
-        return "offline"
-    if diff > IDLE_THRESHOLD:
-        return "idle"
-    return "online"
-
-# -----------------------------
-async def push_state(device_id):
-    status = calc_status(device_id)
-    old = device_status.get(device_id)
-
-    if old != status:
-        device_status[device_id] = status
-
-        await send_log("STATE_CHANGE", {
-            "device_id": device_id,
-            "status": status,
-            "age": round(now() - device_last_seen.get(device_id, 0), 2)
+      ws.send(
+        JSON.stringify({
+          type: "register_dashboard",
         })
+      );
+    };
 
-        await broadcast({
-            "type": "pc_status",
-            "device_id": device_id,
-            "status": status,
-            "last_seen": device_last_seen.get(device_id, 0)
-        })
+    ws.onmessage = (event) => {
+      let msg;
 
-# -----------------------------
-async def handler(ws):
-    device_id = None
-    client_type = None
+      try {
+        msg = JSON.parse(event.data);
+      } catch {
+        addLog("Bad packet: " + event.data);
+        return;
+      }
 
-    try:
-        async for msg in ws:
-            data = json.loads(msg)
-            msg_type = data.get("type")
+      addLog(msg);
 
-            # ---------------- PC ----------------
-            if msg_type == "register":
-                device_id = data["device_id"]
-                client_type = "pc"
+      const id = msg.device_id;
 
-                devices[device_id] = ws
-                device_last_seen[device_id] = now()
+      // ---------------- DEVICE STATE ----------------
+      if (msg.type === "pc_status") {
+        upsertDevice(id, {
+          status: msg.status,
+          lastSeen: Date.now(),
+        });
+      }
 
-                await send_log("PC_ONLINE", {"device_id": device_id})
-                await push_state(device_id)
+      if (msg.type === "pc_activity") {
+        upsertDevice(id, {
+          status: "online",
+          lastSeen: Date.now(),
+        });
+      }
 
-            # ---------------- HEARTBEAT ----------------
-            elif msg_type == "heartbeat":
-                dev = data.get("device_id")
+      // ---------------- DEBUG LOGS ----------------
+      if (msg.type === "debug") {
+        addLog(msg.data);
+      }
+    };
 
-                if dev:
-                    device_last_seen[dev] = now()
+    ws.onclose = () => addLog("Disconnected");
+    ws.onerror = () => addLog("Connection error");
 
-                    await send_log("HEARTBEAT", {
-                        "device_id": dev
-                    })
+    return () => ws.close();
+  }, []);
 
-                    await push_state(dev)
+  // -----------------------------
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setDevices((prev) => {
+        const now = Date.now();
+        const updated = { ...prev };
 
-            # ---------------- MOBILE ----------------
-            elif msg_type == "register_mobile":
-                client_type = "mobile"
-                mobile_clients.add(ws)
+        Object.values(updated).forEach((d) => {
+          const diff = now - (d.lastSeen || 0);
 
-                await send_log("MOBILE_CONNECT")
+          if (diff > 30000) d.status = "offline";
+          else if (diff > 10000) d.status = "idle";
+          else d.status = "online";
+        });
 
-            # ---------------- DASHBOARD ----------------
-            elif msg_type == "register_dashboard":
-                client_type = "dashboard"
-                dashboard_clients.add(ws)
+        return { ...updated };
+      });
+    }, 1000);
 
-                await send_log("DASHBOARD_CONNECT")
+    return () => clearInterval(interval);
+  }, []);
 
-            # ---------------- COMMANDS ----------------
-            elif msg_type in ["shutdown_pc", "restart_pc", "lock_pc"]:
-                await send_log("COMMAND", {"type": msg_type})
+  // -----------------------------
+  const getColor = (status) => {
+    if (status === "online") return "#4ade80";
+    if (status === "idle") return "#fbbf24";
+    return "#ef4444";
+  };
 
-                dev = data.get("device_id")
-                if dev in devices:
-                    await devices[dev].send(json.dumps({
-                        "type": msg_type,
-                        "data": {}
-                    }))
+  // -----------------------------
+  return (
+    <div style={styles.container}>
+      <h1 style={{ color: "white" }}>PC Dashboard</h1>
 
-            elif msg_type == "wake_pc":
-                send_wol()
+      {/* DEVICES */}
+      <h3 style={{ color: "white" }}>Devices</h3>
 
-    except Exception as e:
-        await send_log("ERROR", {"error": str(e)})
+      {Object.keys(devices).length === 0 && (
+        <p style={{ color: "#aaa" }}>Waiting for devices to connect...</p>
+      )}
 
-    finally:
-        if client_type == "pc" and device_id:
-            await send_log("PC_DISCONNECT", {"device_id": device_id})
+      {Object.values(devices).map((d) => (
+        <div key={d.id} style={styles.card}>
+          <h3 style={{ color: "white" }}>{d.id}</h3>
 
-            devices.pop(device_id, None)
-            await push_state(device_id)
+          <p style={{ color: getColor(d.status) }}>
+            {d.status?.toUpperCase()}
+          </p>
 
-        if client_type == "mobile":
-            mobile_clients.discard(ws)
-            await send_log("MOBILE_DISCONNECT")
+          <p style={{ color: "#aaa", fontSize: 12 }}>
+            Last seen: {Math.floor((Date.now() - d.lastSeen) / 1000)}s ago
+          </p>
 
-        if client_type == "dashboard":
-            dashboard_clients.discard(ws)
-            await send_log("DASHBOARD_DISCONNECT")
+          <div style={{ display: "flex", gap: 10 }}>
+            <button
+              onClick={() =>
+                wsRef.current.send(
+                  JSON.stringify({
+                    type: "wake_pc",
+                    device_id: d.id,
+                  })
+                )
+              }
+            >
+              Wake
+            </button>
 
-# -----------------------------
-async def main():
-    print("[SERVER STARTED]")
+            <button
+              onClick={() =>
+                wsRef.current.send(
+                  JSON.stringify({
+                    type: "shutdown_pc",
+                    device_id: d.id,
+                  })
+                )
+              }
+            >
+              Shutdown
+            </button>
 
-    async with websockets.serve(handler, "0.0.0.0", 8000):
-        await asyncio.Future()
+            <button
+              onClick={() =>
+                wsRef.current.send(
+                  JSON.stringify({
+                    type: "restart_pc",
+                    device_id: d.id,
+                  })
+                )
+              }
+            >
+              Restart
+            </button>
+          </div>
+        </div>
+      ))}
 
-if __name__ == "__main__":
-    asyncio.run(main())
+      {/* LOGS */}
+      <h3 style={{ color: "white", marginTop: 20 }}>Live Logs</h3>
+
+      <div style={styles.logBox}>
+        {logs.map((l, i) => (
+          <div key={i} style={styles.logLine}>
+            <span style={{ color: "#666" }}>{l.time}</span>{" "}
+            <span style={{ color: "#aaa" }}>{l.msg}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// -----------------------------
+const styles = {
+  container: {
+    background: "#0b0f14",
+    minHeight: "100vh",
+    padding: 20,
+  },
+  card: {
+    background: "#141a22",
+    padding: 15,
+    borderRadius: 10,
+    marginTop: 10,
+  },
+  logBox: {
+    background: "#0f141b",
+    padding: 10,
+    borderRadius: 10,
+    height: 250,
+    overflowY: "auto",
+  },
+  logLine: {
+    fontSize: 12,
+    marginBottom: 4,
+  },
+};
