@@ -54,18 +54,27 @@ async def send_to_device(device_id, payload):
 # -----------------------------
 async def handler(ws):
     device_id = None
+    mobile = False
 
     try:
         async for msg in ws:
             data = json.loads(msg)
             msg_type = data.get("type")
 
-            # ---------------- REGISTER PC ----------------
+            # ---------------- PC REGISTER ----------------
             if msg_type == "register":
                 device_id = data["device_id"]
                 devices[device_id] = ws
                 device_last_seen[device_id] = time.time()
                 print(f"[PC ONLINE] {device_id}")
+
+                # notify all mobiles PC is online
+                for m in mobile_clients:
+                    await m.send(json.dumps({
+                        "type": "pc_status",
+                        "status": "online",
+                        "device_id": device_id
+                    }))
 
             # ---------------- HEARTBEAT ----------------
             elif msg_type == "heartbeat":
@@ -73,10 +82,20 @@ async def handler(ws):
                 if dev in devices:
                     device_last_seen[dev] = time.time()
 
-            # ---------------- MOBILE REGISTER (FIXED) ----------------
+            # ---------------- MOBILE REGISTER ----------------
             elif msg_type == "register_mobile":
+                mobile = True
                 mobile_clients.add(ws)
+
                 print("[MOBILE CONNECTED]")
+
+                # immediately tell mobile PC status
+                for dev in devices:
+                    await ws.send(json.dumps({
+                        "type": "pc_status",
+                        "status": "online",
+                        "device_id": dev
+                    }))
 
             # ---------------- PAIR REQUEST ----------------
             elif msg_type == "request_pair":
@@ -133,7 +152,8 @@ async def handler(ws):
             print(f"[DISCONNECTED] {device_id}")
 
         # cleanup mobile
-        mobile_clients.discard(ws)
+        if ws in mobile_clients:
+            mobile_clients.remove(ws)
 
 # -----------------------------
 async def cleanup_loop():
