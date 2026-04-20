@@ -7,6 +7,7 @@ import socket
 import time
 
 devices = {}
+mobile_clients = set()
 paired_devices = set()
 device_last_seen = {}
 
@@ -72,8 +73,9 @@ async def handler(ws):
                 if dev in devices:
                     device_last_seen[dev] = time.time()
 
-            # ---------------- MOBILE ----------------
+            # ---------------- MOBILE REGISTER (FIXED) ----------------
             elif msg_type == "register_mobile":
+                mobile_clients.add(ws)
                 print("[MOBILE CONNECTED]")
 
             # ---------------- PAIR REQUEST ----------------
@@ -103,7 +105,7 @@ async def handler(ws):
 
                     print(f"[PAIRED] {dev}")
 
-            # ---------------- RELOAD AGENT (NEW FEATURE) ----------------
+            # ---------------- RELOAD AGENT ----------------
             elif msg_type == "reload_agent":
                 await send_to_device(data.get("device_id"), {
                     "type": "reload_agent",
@@ -124,10 +126,14 @@ async def handler(ws):
         print("[WS ERROR]", e)
 
     finally:
+        # cleanup PC
         if device_id:
             devices.pop(device_id, None)
             device_last_seen.pop(device_id, None)
             print(f"[DISCONNECTED] {device_id}")
+
+        # cleanup mobile
+        mobile_clients.discard(ws)
 
 # -----------------------------
 async def cleanup_loop():

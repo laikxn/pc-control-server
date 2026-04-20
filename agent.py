@@ -9,7 +9,7 @@ import socket
 import sys
 
 # -----------------------------
-SERVER_URL = "ws://192.168.1.204:8000"
+SERVER_URL = "ws://192.168.1.230:8000"
 DEVICE_ID_FILE = "device_id.txt"
 
 TARGET_MAC = "3C:6A:D2:41:58:F9"
