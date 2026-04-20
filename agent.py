@@ -37,7 +37,9 @@ def restart_agent():
 
 # -----------------------------
 def shutdown_pc():
-    os.system("shutdown /s /t 0")
+    with open("shutdown_test.log", "a") as f:
+        f.write("shutdown command received\n")
+    print("[TEST] shutdown command received")
 
 def restart_pc():
     os.system("shutdown /r /t 0")

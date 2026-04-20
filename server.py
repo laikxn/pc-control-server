@@ -133,10 +133,11 @@ async def handler(ws):
 
             # ---------------- COMMANDS ----------------
             elif msg_type in ["shutdown_pc", "restart_pc", "lock_pc"]:
+                print(f"[COMMAND RECEIVED FROM APP] {msg_type} → sending to agent")
                 await send_to_device(data.get("device_id"), {
-                    "type": msg_type,
-                    "data": {}
-                })
+                "type": msg_type,
+                "data": {}
+            })
 
             elif msg_type == "wake_pc":
                 send_wol()
