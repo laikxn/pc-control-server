@@ -98,31 +98,31 @@ async def handle_command(cmd, ws):
 
 # -----------------------------
 async def connect():
-    print(f"[START] {DEVICE_ID}")
-
     while True:
         try:
-            async with websockets.connect(SERVER_URL) as ws:
-                print("[SOCKET OPENED]")
-
-                await ws.send(json.dumps({
-                    "type": "register",
-                    "device_id": DEVICE_ID
-                }))
-
-                print("[REGISTER SENT]")
-
-                # ✅ IMPORTANT: restart heartbeat every connection
-                heartbeat_task = asyncio.create_task(send_heartbeat(ws))
+            async with websockets.connect("ws://YOUR_SERVER:8000") as ws:
+                print("[CONNECTED]")
 
                 while True:
-                    msg = await ws.recv()
-                    cmd = json.loads(msg)
-                    await handle_command(cmd, ws)
+                    try:
+                        msg = await ws.recv()
+                        # handle msg here
+
+                    except websockets.ConnectionClosed:
+                        print("[DISCONNECTED] reconnecting...")
+                        break
 
         except Exception as e:
-            print(f"[DISCONNECTED] retrying... {e}")
-            await asyncio.sleep(3)
+            print("[CONNECTION ERROR]", e)
+
+        await asyncio.sleep(3)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(connect())
+    except KeyboardInterrupt:
+        print("\n[EXIT] Agent stopped cleanly")
 
 # -----------------------------
 if __name__ == "__main__":
