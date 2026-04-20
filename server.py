@@ -16,16 +16,18 @@ dashboard_clients = set()
 device_last_seen = {}
 device_status = {}
 
-PAIR_FILE = "paired.json"
-pair_codes = {}
+pending_acks = {}
 
 IDLE_THRESHOLD = 10
 OFFLINE_THRESHOLD = 25
+
+RECONNECT_GRACE = 6  # prevents instant offline after reconnect
 
 # -----------------------------
 def gen_code():
     return str(random.randint(100000, 999999))
 
+# -----------------------------
 def send_wol():
     TARGET_MAC = "3C:6A:D2:41:58:F9"
     mac_bytes = bytes.fromhex(TARGET_MAC.replace(":", ""))
@@ -49,7 +51,7 @@ async def broadcast(payload):
                 group.discard(ws)
 
 # -----------------------------
-def calculate_status(device_id):
+def calc_status(device_id):
     now = time.time()
     last = device_last_seen.get(device_id, 0)
 
@@ -66,8 +68,14 @@ def calculate_status(device_id):
 
 # -----------------------------
 async def push_state(device_id):
-    status = calculate_status(device_id)
+    status = calc_status(device_id)
     old = device_status.get(device_id)
+
+    # prevent flicker on reconnect
+    if status == "offline" and device_id in devices:
+        last = device_last_seen.get(device_id, 0)
+        if time.time() - last < RECONNECT_GRACE:
+            status = "online"
 
     if old != status:
         device_status[device_id] = status
@@ -113,7 +121,6 @@ async def handler(ws):
                 device_last_seen[device_id] = time.time()
 
                 print(f"[PC ONLINE] {device_id}")
-
                 await push_state(device_id)
 
             elif msg_type == "heartbeat":
@@ -127,6 +134,7 @@ async def handler(ws):
             elif msg_type == "register_mobile":
                 client_type = "mobile"
                 mobile_clients.add(ws)
+
                 print("[MOBILE CONNECTED]")
 
                 for dev in device_status:
@@ -141,6 +149,7 @@ async def handler(ws):
             elif msg_type == "register_dashboard":
                 client_type = "dashboard"
                 dashboard_clients.add(ws)
+
                 print("[DASHBOARD CONNECTED]")
 
                 for dev in device_status:
@@ -165,11 +174,14 @@ async def handler(ws):
         print("[WS ERROR]", e)
 
     finally:
-        # ---------------- CLEAN DISCONNECT ----------------
+        # ---------------- CLEANUP ----------------
         if client_type == "pc" and device_id:
             print(f"[PC DISCONNECTED] {device_id}")
 
             devices.pop(device_id, None)
+
+            # DO NOT instantly mark offline (prevents flicker)
+            await asyncio.sleep(1)
             await push_state(device_id)
 
         if client_type == "mobile":
@@ -185,7 +197,8 @@ async def state_monitor():
     while True:
         for dev in list(device_last_seen.keys()):
             await push_state(dev)
-        await asyncio.sleep(2)
+
+        await asyncio.sleep(3)
 
 # -----------------------------
 async def main():
