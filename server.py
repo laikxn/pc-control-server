@@ -67,18 +67,7 @@ async def send_to_device(device_id, payload):
 # -----------------------------
 async def handler(ws):
     device_id = None
-    elif msg_type == "register_mobile":
-    is_mobile = True
-    mobile_clients.add(ws)
-
-    print("[MOBILE CONNECTED]")
-
-    for dev in devices:
-        await ws.send(json.dumps({
-            "type": "pc_status",
-            "status": "online",
-            "device_id": dev
-        }))
+    is_mobile = False
 
     try:
         async for msg in ws:
@@ -93,12 +82,25 @@ async def handler(ws):
 
                 print(f"[PC ONLINE] {device_id}")
 
-                # notify all mobiles
                 for m in list(mobile_clients):
                     await m.send(json.dumps({
                         "type": "pc_status",
                         "status": "online",
                         "device_id": device_id
+                    }))
+
+            # ---------------- MOBILE REGISTER ----------------
+            elif msg_type == "register_mobile":
+                is_mobile = True
+                mobile_clients.add(ws)
+
+                print("[MOBILE CONNECTED]")
+
+                for dev in devices:
+                    await ws.send(json.dumps({
+                        "type": "pc_status",
+                        "status": "online",
+                        "device_id": dev
                     }))
 
             # ---------------- ACK ----------------
@@ -115,19 +117,6 @@ async def handler(ws):
                 dev = data.get("device_id")
                 if dev in devices:
                     device_last_seen[dev] = time.time()
-
-            # ---------------- MOBILE REGISTER ----------------
-            elif msg_type == "register_mobile":
-                is_mobile = True
-                mobile_clients.add(ws)
-                print("[MOBILE CONNECTED]")
-
-                for dev in devices:
-                    await ws.send(json.dumps({
-                        "type": "pc_status",
-                        "status": "online",
-                        "device_id": dev
-                    }))
 
             # ---------------- PAIR ----------------
             elif msg_type == "request_pair":
@@ -182,11 +171,6 @@ async def handler(ws):
             device_last_seen.pop(device_id, None)
             print(f"[DISCONNECTED] {device_id}")
 
-        if ws in mobile_clients:
-            mobile_clients.remove(ws)
-            
-                           # cleanup mobile
-        if is_mobile:
         if ws in mobile_clients:
             mobile_clients.remove(ws)
             print("[MOBILE DISCONNECTED]")
