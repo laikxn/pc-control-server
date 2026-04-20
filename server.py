@@ -2,7 +2,6 @@ import asyncio
 import websockets
 import json
 import random
-import os
 import socket
 import time
 import logging
@@ -10,21 +9,18 @@ import logging
 logging.getLogger("websockets").setLevel(logging.ERROR)
 
 # -----------------------------
-devices = {}              # pc websockets
+devices = {}
 mobile_clients = set()
 dashboard_clients = set()
 
 device_last_seen = {}
-device_status = {}        # ONLINE / IDLE / OFFLINE
-
-pending_acks = {}
+device_status = {}
 
 PAIR_FILE = "paired.json"
 pair_codes = {}
 
-# tuning
-IDLE_THRESHOLD = 10       # seconds
-OFFLINE_THRESHOLD = 25    # seconds
+IDLE_THRESHOLD = 10
+OFFLINE_THRESHOLD = 25
 
 # -----------------------------
 def gen_code():
@@ -43,7 +39,6 @@ def send_wol():
 
 # -----------------------------
 async def broadcast(payload):
-    """Send to dashboards + mobile apps"""
     msg = json.dumps(payload)
 
     for group in [mobile_clients, dashboard_clients]:
@@ -54,35 +49,36 @@ async def broadcast(payload):
                 group.discard(ws)
 
 # -----------------------------
-async def update_state(device_id):
-    """Recalculate state from last_seen"""
+def calculate_status(device_id):
     now = time.time()
     last = device_last_seen.get(device_id, 0)
 
     if device_id not in devices:
-        new_status = "offline"
-    else:
-        diff = now - last
+        return "offline"
 
-        if diff > OFFLINE_THRESHOLD:
-            new_status = "offline"
-        elif diff > IDLE_THRESHOLD:
-            new_status = "idle"
-        else:
-            new_status = "online"
+    diff = now - last
 
+    if diff > OFFLINE_THRESHOLD:
+        return "offline"
+    elif diff > IDLE_THRESHOLD:
+        return "idle"
+    return "online"
+
+# -----------------------------
+async def push_state(device_id):
+    status = calculate_status(device_id)
     old = device_status.get(device_id)
 
-    if old != new_status:
-        device_status[device_id] = new_status
+    if old != status:
+        device_status[device_id] = status
 
-        print(f"[STATE] {device_id} → {new_status}")
+        print(f"[STATE] {device_id} → {status}")
 
         await broadcast({
             "type": "pc_status",
             "device_id": device_id,
-            "status": new_status,
-            "last_seen": last
+            "status": status,
+            "last_seen": device_last_seen.get(device_id, 0)
         })
 
 # -----------------------------
@@ -93,13 +89,10 @@ async def send_to_device(device_id, payload):
 
     try:
         payload["command_id"] = str(random.randint(100000, 999999))
-
         await ws.send(json.dumps(payload))
-
         print(f"[SEND] {device_id} → {payload['type']}")
-
-    except Exception as e:
-        print("[SEND ERROR]", e)
+    except:
+        print("[SEND ERROR]")
 
 # -----------------------------
 async def handler(ws):
@@ -119,16 +112,16 @@ async def handler(ws):
                 devices[device_id] = ws
                 device_last_seen[device_id] = time.time()
 
-                print(f"[PC CONNECTED] {device_id}")
+                print(f"[PC ONLINE] {device_id}")
 
-                await update_state(device_id)
+                await push_state(device_id)
 
             elif msg_type == "heartbeat":
                 dev = data.get("device_id")
 
                 if dev:
                     device_last_seen[dev] = time.time()
-                    await update_state(dev)
+                    await push_state(dev)
 
             # ---------------- MOBILE ----------------
             elif msg_type == "register_mobile":
@@ -136,7 +129,6 @@ async def handler(ws):
                 mobile_clients.add(ws)
                 print("[MOBILE CONNECTED]")
 
-                # send full snapshot
                 for dev in device_status:
                     await ws.send(json.dumps({
                         "type": "pc_status",
@@ -149,7 +141,6 @@ async def handler(ws):
             elif msg_type == "register_dashboard":
                 client_type = "dashboard"
                 dashboard_clients.add(ws)
-
                 print("[DASHBOARD CONNECTED]")
 
                 for dev in device_status:
@@ -174,12 +165,12 @@ async def handler(ws):
         print("[WS ERROR]", e)
 
     finally:
-        # cleanup
+        # ---------------- CLEAN DISCONNECT ----------------
         if client_type == "pc" and device_id:
             print(f"[PC DISCONNECTED] {device_id}")
-            devices.pop(device_id, None)
 
-            await update_state(device_id)
+            devices.pop(device_id, None)
+            await push_state(device_id)
 
         if client_type == "mobile":
             mobile_clients.discard(ws)
@@ -191,12 +182,10 @@ async def handler(ws):
 
 # -----------------------------
 async def state_monitor():
-    """continuously enforces state correctness"""
     while True:
         for dev in list(device_last_seen.keys()):
-            await update_state(dev)
-
-        await asyncio.sleep(3)
+            await push_state(dev)
+        await asyncio.sleep(2)
 
 # -----------------------------
 async def main():
