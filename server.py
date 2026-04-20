@@ -10,6 +10,7 @@ devices = {}
 mobile_clients = set()
 paired_devices = set()
 device_last_seen = {}
+pending_acks = {}
 
 PAIR_FILE = "paired.json"
 pair_codes = {}
@@ -44,17 +45,29 @@ def send_wol():
 # -----------------------------
 async def send_to_device(device_id, payload):
     ws = devices.get(device_id)
-    if ws:
-        try:
-            await ws.send(json.dumps(payload))
-            print(f"[SEND → {device_id}] {payload['type']}")
-        except Exception as e:
-            print("[SEND ERROR]", e)
+    if not ws:
+        return
+
+    try:
+        command_id = str(random.randint(100000, 999999))
+
+        payload["command_id"] = command_id
+        pending_acks[command_id] = {
+            "device_id": device_id,
+            "type": payload["type"],
+            "time": time.time()
+        }
+
+        await ws.send(json.dumps(payload))
+        print(f"[SEND → {device_id}] {payload['type']} ({command_id})")
+
+    except Exception as e:
+        print("[SEND ERROR]", e)
 
 # -----------------------------
 async def handler(ws):
     device_id = None
-    mobile = False
+    is_mobile = False
 
     try:
         async for msg in ws:
@@ -66,15 +79,25 @@ async def handler(ws):
                 device_id = data["device_id"]
                 devices[device_id] = ws
                 device_last_seen[device_id] = time.time()
+
                 print(f"[PC ONLINE] {device_id}")
 
-                # notify all mobiles PC is online
-                for m in mobile_clients:
+                # notify all mobiles
+                for m in list(mobile_clients):
                     await m.send(json.dumps({
                         "type": "pc_status",
                         "status": "online",
                         "device_id": device_id
                     }))
+
+            # ---------------- ACK ----------------
+            elif msg_type == "ack":
+                cmd_id = data.get("command_id")
+                status = data.get("status")
+
+                if cmd_id in pending_acks:
+                    print(f"[ACK RECEIVED] {cmd_id} → {status}")
+                    del pending_acks[cmd_id]
 
             # ---------------- HEARTBEAT ----------------
             elif msg_type == "heartbeat":
@@ -84,12 +107,10 @@ async def handler(ws):
 
             # ---------------- MOBILE REGISTER ----------------
             elif msg_type == "register_mobile":
-                mobile = True
+                is_mobile = True
                 mobile_clients.add(ws)
-
                 print("[MOBILE CONNECTED]")
 
-                # immediately tell mobile PC status
                 for dev in devices:
                     await ws.send(json.dumps({
                         "type": "pc_status",
@@ -97,7 +118,7 @@ async def handler(ws):
                         "device_id": dev
                     }))
 
-            # ---------------- PAIR REQUEST ----------------
+            # ---------------- PAIR ----------------
             elif msg_type == "request_pair":
                 code = gen_code()
 
@@ -110,7 +131,6 @@ async def handler(ws):
                         "code": code
                     }))
 
-            # ---------------- CONFIRM PAIR ----------------
             elif msg_type == "confirm_pair":
                 code = data.get("code")
 
@@ -124,7 +144,7 @@ async def handler(ws):
 
                     print(f"[PAIRED] {dev}")
 
-            # ---------------- RELOAD AGENT ----------------
+            # ---------------- RELOAD ----------------
             elif msg_type == "reload_agent":
                 await send_to_device(data.get("device_id"), {
                     "type": "reload_agent",
@@ -133,11 +153,11 @@ async def handler(ws):
 
             # ---------------- COMMANDS ----------------
             elif msg_type in ["shutdown_pc", "restart_pc", "lock_pc"]:
-                print(f"[COMMAND RECEIVED FROM APP] {msg_type} → sending to agent")
+                print(f"[COMMAND RECEIVED] {msg_type}")
                 await send_to_device(data.get("device_id"), {
-                "type": msg_type,
-                "data": {}
-            })
+                    "type": msg_type,
+                    "data": {}
+                })
 
             elif msg_type == "wake_pc":
                 send_wol()
@@ -146,13 +166,11 @@ async def handler(ws):
         print("[WS ERROR]", e)
 
     finally:
-        # cleanup PC
         if device_id:
             devices.pop(device_id, None)
             device_last_seen.pop(device_id, None)
             print(f"[DISCONNECTED] {device_id}")
 
-        # cleanup mobile
         if ws in mobile_clients:
             mobile_clients.remove(ws)
 
@@ -160,11 +178,11 @@ async def handler(ws):
 async def cleanup_loop():
     while True:
         now = time.time()
-        dead = []
 
-        for dev, last in device_last_seen.items():
-            if now - last > 60:
-                dead.append(dev)
+        dead = [
+            d for d, last in device_last_seen.items()
+            if now - last > 60
+        ]
 
         for d in dead:
             print(f"[TIMEOUT] Removing {d}")
@@ -184,6 +202,5 @@ async def main():
         asyncio.create_task(cleanup_loop())
         await asyncio.Future()
 
-# -----------------------------
 if __name__ == "__main__":
     asyncio.run(main())

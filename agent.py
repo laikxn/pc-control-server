@@ -4,15 +4,15 @@ import json
 import uuid
 import time
 import os
-import subprocess
 import socket
 import sys
 
-# -----------------------------
 SERVER_URL = "ws://192.168.1.230:8000"
 DEVICE_ID_FILE = "device_id.txt"
 
 TARGET_MAC = "3C:6A:D2:41:58:F9"
+
+ws_global = None
 
 # -----------------------------
 def get_device_id():
@@ -29,16 +29,7 @@ def get_device_id():
 DEVICE_ID = get_device_id()
 
 # -----------------------------
-def restart_agent():
-    print("[RESTARTING AGENT]")
-
-    python = sys.executable
-    os.execl(python, python, *sys.argv)
-
-# -----------------------------
 def shutdown_pc():
-    with open("shutdown_test.log", "a") as f:
-        f.write("shutdown command received\n")
     print("[TEST] shutdown command received")
 
 def restart_pc():
@@ -70,33 +61,49 @@ async def send_heartbeat(ws):
 
 # -----------------------------
 async def handle_command(cmd):
+    global ws_global
+
     t = cmd.get("type")
+    cmd_id = cmd.get("command_id")
 
     print(f"[COMMAND] {t}")
 
-    if t == "shutdown_pc":
-        shutdown_pc()
+    try:
+        if t == "shutdown_pc":
+            shutdown_pc()
 
-    elif t == "restart_pc":
-        restart_pc()
+        elif t == "restart_pc":
+            restart_pc()
 
-    elif t == "lock_pc":
-        lock_pc()
+        elif t == "lock_pc":
+            lock_pc()
 
-    elif t == "wake_pc":
-        wake_on_lan(TARGET_MAC)
+        elif t == "wake_pc":
+            wake_on_lan(TARGET_MAC)
 
-    elif cmd_type == "reload_agent":
-        print("[ACTION] Reload requested from server")
-        os._exit(0)
+        elif t == "reload_agent":
+            os._exit(0)
+
+        if cmd_id and ws_global:
+            await ws_global.send(json.dumps({
+                "type": "ack",
+                "command_id": cmd_id,
+                "status": "executed"
+            }))
+
+    except Exception as e:
+        print("[COMMAND ERROR]", e)
 
 # -----------------------------
 async def connect():
+    global ws_global
+
     print(f"[START] {DEVICE_ID}")
 
     while True:
         try:
             async with websockets.connect(SERVER_URL) as ws:
+                ws_global = ws
 
                 print("[SOCKET OPENED]")
 
@@ -118,6 +125,5 @@ async def connect():
             print(f"[DISCONNECTED] retrying... {e}")
             await asyncio.sleep(3)
 
-# -----------------------------
 if __name__ == "__main__":
     asyncio.run(connect())
