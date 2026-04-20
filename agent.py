@@ -50,13 +50,15 @@ def wake_on_lan(mac):
 async def send_heartbeat(ws):
     while True:
         try:
+            print("[HEARTBEAT SENT]")
             await ws.send(json.dumps({
                 "type": "heartbeat",
                 "device_id": DEVICE_ID,
                 "timestamp": time.time()
             }))
             await asyncio.sleep(10)
-        except:
+        except Exception as e:
+            print("[HEARTBEAT ERROR]", e)
             break
 
 # -----------------------------
