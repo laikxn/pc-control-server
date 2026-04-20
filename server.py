@@ -4,6 +4,8 @@ import json
 import random
 import os
 import socket
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 devices = {}
 paired_devices = set()
@@ -45,17 +47,6 @@ async def send_to_device(target, payload):
         print(f"[SEND → {target}] {payload['type']}")
 
 # -----------------------------
-# IMPORTANT: This prevents Render HTTP/HEAD requests from crashing WebSocket
-async def process_request(path, request_headers):
-    if path == "/":
-        return (
-            200,
-            [("Content-Type", "text/plain")],
-            b"Server is running"
-        )
-    return None
-
-# -----------------------------
 async def handler(ws):
     device_id = None
 
@@ -64,17 +55,14 @@ async def handler(ws):
             data = json.loads(msg)
             msg_type = data.get("type")
 
-            # ---------------- PC ----------------
             if msg_type == "register":
                 device_id = data["device_id"]
                 devices[device_id] = ws
                 print(f"[PC ONLINE] {device_id}")
 
-            # ---------------- MOBILE ----------------
             elif msg_type == "register_mobile":
                 print("[MOBILE CONNECTED]")
 
-            # ---------------- PAIRING ----------------
             elif msg_type == "request_pair":
                 code = gen_code()
 
@@ -100,7 +88,6 @@ async def handler(ws):
 
                     print(f"[PAIRED] {dev}")
 
-            # ---------------- COMMANDS ----------------
             elif msg_type == "shutdown_pc":
                 await send_to_device(data.get("device_id"), {
                     "type": "shutdown_pc",
@@ -131,20 +118,34 @@ async def handler(ws):
             print(f"[DISCONNECTED] {device_id}")
 
 # -----------------------------
-async def main():
-    load_pairs()
+# HTTP SERVER (Render health check fix)
+class SimpleHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
 
-    port = int(os.environ.get("PORT", 8000))
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
 
-    server = await websockets.serve(
-        handler,
-        "0.0.0.0",
-        port,
-        process_request=process_request
-    )
-
-    print(f"[SERVER RUNNING] on port {port}")
-    await asyncio.Future()
+def run_http():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), SimpleHandler)
+    print(f"[HTTP RUNNING] on {port}")
+    server.serve_forever()
 
 # -----------------------------
-asyncio.run(main())
+async def main_ws():
+    load_pairs()
+
+    port = 8000
+    server = await websockets.serve(handler, "0.0.0.0", port)
+
+    print(f"[WS RUNNING] on {port}")
+    await server.wait_closed()
+
+# -----------------------------
+if __name__ == "__main__":
+    threading.Thread(target=run_http, daemon=True).start()
+    asyncio.run(main_ws())
