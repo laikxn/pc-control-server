@@ -51,15 +51,25 @@ def gen_code():
     return str(random.randint(100000, 999999))
 
 def send_wol():
-    TARGET_MAC = "3C:6A:D2:41:58:F9"
-    mac_bytes = bytes.fromhex(TARGET_MAC.replace(":", ""))
-    packet = b"\xff" * 6 + mac_bytes * 16
+    try:
+        TARGET_MAC = "3C:6A:D2:41:58:F9"
 
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        s.sendto(packet, ("255.255.255.255", 9))
+        print("[WOL] Attempting send...")
+        
+        mac_bytes = bytes.fromhex(TARGET_MAC.replace(":", ""))
+        packet = b"\xff" * 6 + mac_bytes * 16
 
-    print("[WOL SENT]")
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            s.sendto(packet, ("255.255.255.255", 9))
+
+        print("[WOL SENT SUCCESS]")
+
+        return True
+
+    except Exception as e:
+        print("[WOL ERROR]", e)
+        return False
 
 # -----------------------------
 async def broadcast(payload):
@@ -113,6 +123,8 @@ async def update_state(device_id):
 async def send_to_device(device_id, payload):
     ws = devices.get(device_id)
     if not ws:
+        print("[SEND FAIL] device not connected:", device_id)
+        await send_log("COMMAND_FAILED", {"device_id": device_id})
         return
 
     try:
@@ -137,8 +149,12 @@ async def handler(ws):
 
     try:
         async for msg in ws:
+            print("[RAW MESSAGE]", msg)  # 🔥 NEW: see EVERYTHING coming in
+
             data = json.loads(msg)
             msg_type = data.get("type")
+
+            await send_log("MESSAGE_RECEIVED", {"type": msg_type})
 
             # ---------------- PC ----------------
             if msg_type == "register":
@@ -205,8 +221,14 @@ async def handler(ws):
                 })
 
             elif msg_type == "wake_pc":
-                send_wol()
-                await send_log("WOL_SENT")
+                print("[WAKE COMMAND RECEIVED]")  # 🔥 CRITICAL DEBUG
+                await send_log("WOL_TRIGGERED")
+
+                success = send_wol()
+
+                await send_log("WOL_RESULT", {
+                    "success": success
+                })
 
     except Exception as e:
         print("[WS ERROR]", e)
