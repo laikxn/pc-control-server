@@ -56,7 +56,6 @@ async def send_heartbeat(ws):
             }))
 
             print("[HEARTBEAT SENT]")
-
             await asyncio.sleep(10)
 
         except Exception as e:
@@ -100,16 +99,28 @@ async def handle_command(cmd, ws):
 async def connect():
     while True:
         try:
-            async with websockets.connect("ws://YOUR_SERVER:8000") as ws:
+            async with websockets.connect(SERVER_URL) as ws:
                 print("[CONNECTED]")
+
+                # register
+                await ws.send(json.dumps({
+                    "type": "register",
+                    "device_id": DEVICE_ID
+                }))
+
+                # start heartbeat task
+                heartbeat_task = asyncio.create_task(send_heartbeat(ws))
 
                 while True:
                     try:
                         msg = await ws.recv()
-                        # handle msg here
+                        data = json.loads(msg)
+
+                        await handle_command(data, ws)
 
                     except websockets.ConnectionClosed:
                         print("[DISCONNECTED] reconnecting...")
+                        heartbeat_task.cancel()
                         break
 
         except Exception as e:
@@ -117,13 +128,9 @@ async def connect():
 
         await asyncio.sleep(3)
 
-
+# -----------------------------
 if __name__ == "__main__":
     try:
         asyncio.run(connect())
     except KeyboardInterrupt:
         print("\n[EXIT] Agent stopped cleanly")
-
-# -----------------------------
-if __name__ == "__main__":
-    asyncio.run(connect())
