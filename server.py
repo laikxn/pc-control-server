@@ -11,20 +11,17 @@ logging.getLogger("websockets").setLevel(logging.ERROR)
 # ─────────────────────────────────────────────
 # State
 # ─────────────────────────────────────────────
-devices        = {}   # device_id -> websocket (PC connections)
-mobile_clients = set()
+devices           = {}   # device_id -> websocket
+mobile_clients    = set()
 dashboard_clients = set()
 
 device_names     = {}
 device_last_seen = {}
 device_status    = {}
 
-pair_codes     = {}   # device_id -> { code, expires_at }
-paired_devices = {}   # device_id -> { device_name }  (in-memory, agent owns the file)
-
-# Pending unpair: if the mobile unpairs a device while the PC is offline,
-# we store it here. When the agent reconnects, we send it immediately.
-pending_unpairs = set()  # set of device_ids
+pair_codes      = {}   # device_id -> { code, expires_at }
+paired_devices  = {}   # device_id -> { device_name }
+pending_unpairs = set()
 
 IDLE_THRESHOLD    = 10
 OFFLINE_THRESHOLD = 25
@@ -118,33 +115,23 @@ async def send_to_device(device_id, payload):
         return False
 
 # ─────────────────────────────────────────────
-# Unpair helpers
+# Unpair
 # ─────────────────────────────────────────────
 async def do_unpair(device_id: str, notify_mobile: bool = True):
-    """
-    Remove pairing for a device.
-    - Notifies the agent (online or queues for next connect).
-    - Notifies all mobile clients to remove the device from their list.
-    """
     paired_devices.pop(device_id, None)
     pair_codes.pop(device_id, None)
 
-    # Notify agent — or queue if offline
     if device_id in devices:
         await send_to_device(device_id, {"type": "unpaired"})
         print(f"[UNPAIRED] {device_id} — agent notified")
     else:
         pending_unpairs.add(device_id)
-        print(f"[UNPAIRED] {device_id} — agent offline, queued for next connect")
+        print(f"[UNPAIRED] {device_id} — agent offline, queued")
 
     await send_log("UNPAIRED", {"device_id": device_id})
 
-    # Always tell all mobile clients to remove this device
     if notify_mobile:
-        await broadcast({
-            "type": "device_removed",
-            "device_id": device_id
-        })
+        await broadcast({"type": "device_removed", "device_id": device_id})
 
 # ─────────────────────────────────────────────
 # Main handler
@@ -168,17 +155,32 @@ async def handler(ws):
                 devices[device_id]          = ws
                 device_last_seen[device_id] = time.time()
                 device_names[device_id]     = data.get("device_name", "Unknown-PC")
-                paired_devices[device_id]   = {"device_name": device_names[device_id]}
 
-                print(f"[PC CONNECTED] {device_id} ({device_names[device_id]})")
-                await send_log("PC_CONNECTED", {"device_id": device_id, "device_name": device_names[device_id]})
+                # ── KEY FIX ──
+                # Only mark as paired on the server if the agent says it's paired.
+                # This prevents a reconnecting agent from re-entering paired_devices
+                # after the mobile has already removed it.
+                agent_is_paired = data.get("is_paired", False)
+                if agent_is_paired:
+                    paired_devices[device_id] = {"device_name": device_names[device_id]}
+                    print(f"[PC CONNECTED] {device_id} ({device_names[device_id]}) — paired")
+                else:
+                    # Make sure it's NOT in paired_devices so pairing isn't blocked
+                    paired_devices.pop(device_id, None)
+                    print(f"[PC CONNECTED] {device_id} ({device_names[device_id]}) — unpaired")
 
-                # Deliver any pending unpair that happened while PC was offline
+                await send_log("PC_CONNECTED", {
+                    "device_id": device_id,
+                    "device_name": device_names[device_id],
+                    "is_paired": agent_is_paired
+                })
+
+                # Deliver pending unpair if it was queued while PC was offline
                 if device_id in pending_unpairs:
                     pending_unpairs.discard(device_id)
                     print(f"[PENDING UNPAIR] Delivering to {device_id}")
+                    paired_devices.pop(device_id, None)
                     await send_to_device(device_id, {"type": "unpaired"})
-                    # Don't call update_state — device is being unpaired
                 else:
                     await update_state(device_id)
 
@@ -197,7 +199,6 @@ async def handler(ws):
                 print("[MOBILE CONNECTED]")
                 await send_log("MOBILE_CONNECTED")
 
-                # Push current state of all known devices
                 for dev_id, status in device_status.items():
                     try:
                         await ws.send(json.dumps({
@@ -210,14 +211,14 @@ async def handler(ws):
                     except:
                         pass
 
-            # ── DASHBOARD REGISTRATION ──
+            # ── DASHBOARD ──
             elif msg_type == "register_dashboard":
                 client_type = "dashboard"
                 dashboard_clients.add(ws)
                 print("[DASHBOARD CONNECTED]")
                 await send_log("DASHBOARD_CONNECTED")
 
-            # ── PAIRING: AGENT REGISTERS ITS CODE ──
+            # ── PAIRING: AGENT REGISTERS CODE ──
             elif msg_type == "set_pair_code":
                 dev_id = data.get("device_id")
                 code   = data.get("code")
@@ -244,12 +245,11 @@ async def handler(ws):
                         break
 
                 if matched_id:
-                    # Check if this device is already paired
                     if matched_id in paired_devices:
-                        # Already paired — tell mobile
+                        # Already paired — block it
                         await ws.send(json.dumps({
                             "type": "pair_error",
-                            "message": "This PC is already paired to a device. Please unpair it first from the PC agent before pairing again."
+                            "message": "This PC is already paired to a device. Please unpair it first from the PC tray icon."
                         }))
                         print(f"[PAIR BLOCKED] {matched_id} already paired")
                     else:
@@ -260,7 +260,6 @@ async def handler(ws):
                         print(f"[PAIRED] {matched_id}")
                         await send_log("PAIRED", {"device_id": matched_id})
 
-                        # Tell agent to save paired.json
                         await send_to_device(matched_id, {"type": "pair_confirmed"})
 
                         await ws.send(json.dumps({
@@ -271,20 +270,20 @@ async def handler(ws):
                             "last_seen": device_last_seen.get(matched_id, 0)
                         }))
                 else:
-                    print(f"[PAIR FAILED] Invalid/expired code: {submitted_code}")
+                    print(f"[PAIR FAILED] Invalid/expired: {submitted_code}")
                     await send_log("PAIR_FAILED", {"code": submitted_code})
                     await ws.send(json.dumps({
                         "type": "pair_error",
                         "message": "Invalid or expired code. Please generate a new one on your PC."
                     }))
 
-            # ── UNPAIR: MOBILE REMOVES DEVICE ──
+            # ── UNPAIR: FROM MOBILE ──
             elif msg_type == "unpair_device":
                 target_id = data.get("device_id")
                 if target_id:
                     await do_unpair(target_id, notify_mobile=False)
 
-            # ── UNPAIR: PC AGENT UNPAIRING FROM ITS SIDE ──
+            # ── UNPAIR: FROM PC TRAY ──
             elif msg_type == "unpair_from_pc":
                 target_id = data.get("device_id")
                 if target_id:
