@@ -11,7 +11,7 @@ logging.getLogger("websockets").setLevel(logging.ERROR)
 # ─────────────────────────────────────────────
 # State
 # ─────────────────────────────────────────────
-devices           = {}   # device_id -> websocket
+devices           = {}
 mobile_clients    = set()
 dashboard_clients = set()
 
@@ -19,8 +19,8 @@ device_names     = {}
 device_last_seen = {}
 device_status    = {}
 
-pair_codes      = {}   # device_id -> { code, expires_at }
-paired_devices  = {}   # device_id -> { device_name }
+pair_codes      = {}
+paired_devices  = {}
 pending_unpairs = set()
 
 IDLE_THRESHOLD    = 10
@@ -156,16 +156,11 @@ async def handler(ws):
                 device_last_seen[device_id] = time.time()
                 device_names[device_id]     = data.get("device_name", "Unknown-PC")
 
-                # ── KEY FIX ──
-                # Only mark as paired on the server if the agent says it's paired.
-                # This prevents a reconnecting agent from re-entering paired_devices
-                # after the mobile has already removed it.
                 agent_is_paired = data.get("is_paired", False)
                 if agent_is_paired:
                     paired_devices[device_id] = {"device_name": device_names[device_id]}
                     print(f"[PC CONNECTED] {device_id} ({device_names[device_id]}) — paired")
                 else:
-                    # Make sure it's NOT in paired_devices so pairing isn't blocked
                     paired_devices.pop(device_id, None)
                     print(f"[PC CONNECTED] {device_id} ({device_names[device_id]}) — unpaired")
 
@@ -175,7 +170,6 @@ async def handler(ws):
                     "is_paired": agent_is_paired
                 })
 
-                # Deliver pending unpair if it was queued while PC was offline
                 if device_id in pending_unpairs:
                     pending_unpairs.discard(device_id)
                     print(f"[PENDING UNPAIR] Delivering to {device_id}")
@@ -246,10 +240,9 @@ async def handler(ws):
 
                 if matched_id:
                     if matched_id in paired_devices:
-                        # Already paired — block it
                         await ws.send(json.dumps({
                             "type": "pair_error",
-                            "message": "This PC is already paired to a device. Please unpair it first from the PC tray icon."
+                            "message": "This PC is already paired to another phone. Please unpair it first from the system tray icon on the PC."
                         }))
                         print(f"[PAIR BLOCKED] {matched_id} already paired")
                     else:

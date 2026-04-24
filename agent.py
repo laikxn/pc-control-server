@@ -7,7 +7,11 @@ Install dependencies:
 
 First run: shows QR popup for pairing.
 After pairing: runs silently in system tray.
-Tray options: Pair New Device | Unpair Device | Quit
+Tray right-click options: Pair / Repair Device | Unpair Device | Quit
+
+IMPORTANT: All tkinter dialogs and popups MUST run on the main thread.
+Tray callbacks run on a different thread, so they only set flags.
+The main loop checks flags and handles UI on the main thread.
 """
 
 import asyncio
@@ -67,7 +71,7 @@ DEVICE_ID   = get_device_id()
 DEVICE_NAME = get_device_name()
 
 # ─────────────────────────────────────────────
-# Paired state
+# Paired state — persisted to disk
 # ─────────────────────────────────────────────
 def is_paired():
     if not os.path.exists(PAIRED_FILE):
@@ -87,15 +91,22 @@ def clear_paired():
     save_paired(False)
 
 # ─────────────────────────────────────────────
-# Shared state
+# Flags — all UI actions are driven through these
+# so that only the main thread touches tkinter.
 # ─────────────────────────────────────────────
-pair_code_ref   = {"code": str(random.randint(100000, 999999))}
-popup_ref       = {"root": None}
-regenerate_flag = {"pending": False}
-unpaired_flag   = {"pending": False}
-loop_ref        = {"loop": None}
-ws_ref          = {"ws": None}
-tray_ref        = {"icon": None}
+flags = {
+    "show_qr":           False,  # open QR popup
+    "close_popup":       False,  # close QR popup (pairing confirmed)
+    "show_unpaired":     False,  # show "unpaired" dialog
+    "tray_unpair":       False,  # tray asked to unpair
+    "tray_quit":         False,  # tray asked to quit
+}
+
+loop_ref = {"loop": None}
+ws_ref   = {"ws": None}
+tray_ref = {"icon": None}
+popup_ref = {"root": None}
+pair_code_ref = {"code": str(random.randint(100000, 999999))}
 
 # ─────────────────────────────────────────────
 # PC commands
@@ -124,8 +135,22 @@ def wake_on_lan(mac: str):
         print("[WOL ERROR]", e)
 
 # ─────────────────────────────────────────────
-# WebSocket
+# WebSocket helpers
 # ─────────────────────────────────────────────
+async def _ws_send(payload: dict):
+    ws = ws_ref.get("ws")
+    if ws:
+        try:
+            await ws.send(json.dumps(payload))
+        except Exception as e:
+            print("[WS SEND ERROR]", e)
+
+def threadsafe_send(payload: dict):
+    """Send a WebSocket message from any thread."""
+    loop = loop_ref.get("loop")
+    if loop and not loop.is_closed():
+        asyncio.run_coroutine_threadsafe(_ws_send(payload), loop)
+
 async def register_pair_code(ws):
     await ws.send(json.dumps({
         "type": "set_pair_code",
@@ -133,6 +158,14 @@ async def register_pair_code(ws):
         "code": pair_code_ref["code"]
     }))
     print(f"[PAIR CODE REGISTERED] {pair_code_ref['code']}")
+
+async def send_register(ws):
+    await ws.send(json.dumps({
+        "type": "register",
+        "device_id": DEVICE_ID,
+        "device_name": DEVICE_NAME,
+        "is_paired": is_paired()
+    }))
 
 async def send_heartbeat(ws):
     while True:
@@ -170,10 +203,11 @@ async def handle_command(cmd, ws):
         elif t == "pair_confirmed":
             save_paired(True)
             print("[PAIRED] Saved to paired.json")
+            flags["close_popup"] = True
         elif t == "unpaired":
             clear_paired()
-            print("[UNPAIRED] Received from server — cleared paired.json")
-            unpaired_flag["pending"] = True
+            print("[UNPAIRED] Received from server")
+            flags["show_unpaired"] = True
 
         if cmd_id:
             await ws.send(json.dumps({
@@ -191,19 +225,8 @@ async def connect():
                 ws_ref["ws"] = ws
                 print("[CONNECTED]")
 
-                # ── KEY FIX ──
-                # Always tell the server our current paired state so it can
-                # correctly set paired_devices without relying on its own
-                # in-memory state which resets on server restart.
-                await ws.send(json.dumps({
-                    "type": "register",
-                    "device_id": DEVICE_ID,
-                    "device_name": DEVICE_NAME,
-                    "is_paired": is_paired()
-                }))
+                await send_register(ws)
 
-                # Only register pair code if not paired — no point showing
-                # a code that will be blocked by "already paired" anyway
                 if not is_paired():
                     await register_pair_code(ws)
 
@@ -233,124 +256,55 @@ def run_async():
     asyncio.set_event_loop(loop)
     loop.run_until_complete(connect())
 
-def reregister_pair_code():
-    ws   = ws_ref.get("ws")
-    loop = loop_ref.get("loop")
-    if ws and loop and not loop.is_closed():
-        asyncio.run_coroutine_threadsafe(register_pair_code(ws), loop)
-
-def send_unpair_to_server():
-    ws   = ws_ref.get("ws")
-    loop = loop_ref.get("loop")
-    if ws and loop and not loop.is_closed():
-        async def _send():
-            await ws.send(json.dumps({
-                "type": "unpair_from_pc",
-                "device_id": DEVICE_ID
-            }))
-        asyncio.run_coroutine_threadsafe(_send(), loop)
-
-def send_register_update():
-    """Re-send register with updated is_paired so server state stays in sync."""
-    ws   = ws_ref.get("ws")
-    loop = loop_ref.get("loop")
-    if ws and loop and not loop.is_closed():
-        async def _send():
-            await ws.send(json.dumps({
-                "type": "register",
-                "device_id": DEVICE_ID,
-                "device_name": DEVICE_NAME,
-                "is_paired": is_paired()
-            }))
-        asyncio.run_coroutine_threadsafe(_send(), loop)
-
 # ─────────────────────────────────────────────
-# Tray icon
+# Tray callbacks — only set flags, NO tkinter here
 # ─────────────────────────────────────────────
+def tray_on_pair(icon, item):
+    """User clicked 'Pair / Repair Device' in tray."""
+    flags["show_qr"] = True
+
+def tray_on_unpair(icon, item):
+    """User clicked 'Unpair Device' in tray."""
+    flags["tray_unpair"] = True
+
+def tray_on_quit(icon, item):
+    """User clicked 'Quit' in tray."""
+    flags["tray_quit"] = True
+
 def make_tray_image():
     img  = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     draw.ellipse([4, 4, 60, 60], fill="#22c55e")
     return img
 
-def tray_pair_device(icon, item):
-    new_code = str(random.randint(100000, 999999))
-    pair_code_ref["code"] = new_code
-    reregister_pair_code()
-    regenerate_flag["pending"] = True
-
-def tray_unpair_device(icon, item):
-    """Triggered from tray: unpair and notify server + mobile."""
-    if not is_paired():
-        # Show info using a proper root window
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showinfo("PC Control Hub", "This PC is not currently paired to any phone.")
-        root.destroy()
-        return
-
-    # ── KEY FIX ──
-    # Always create a hidden root window before calling messagebox.
-    # Without this, tkinter has no event loop and the dialog silently fails.
-    root = tk.Tk()
-    root.withdraw()
-    result = messagebox.askyesno(
-        "Unpair Device",
-        "This will disconnect your phone from this PC.\n\nAre you sure you want to unpair?",
-        icon="warning"
-    )
-    root.destroy()
-
-    if not result:
-        return
-
-    clear_paired()
-    send_unpair_to_server()
-    # Update server's paired_devices immediately
-    send_register_update()
-    print("[TRAY] Unpaired from PC side")
-
-    root2 = tk.Tk()
-    root2.withdraw()
-    again = messagebox.askyesno(
-        "Pair New Device?",
-        "Would you like to pair this PC with a new phone?",
-    )
-    root2.destroy()
-
-    if again:
-        new_code = str(random.randint(100000, 999999))
-        pair_code_ref["code"] = new_code
-        reregister_pair_code()
-        regenerate_flag["pending"] = True
-
-def tray_quit(icon, item):
-    icon.stop()
-    sys.exit(0)
-
 def start_tray():
     if not TRAY_AVAILABLE:
         return
     menu = pystray.Menu(
-        pystray.MenuItem("Pair / Repair Device", tray_pair_device),
-        pystray.MenuItem("Unpair Device",         tray_unpair_device),
+        pystray.MenuItem("Pair / Repair Device", tray_on_pair),
+        pystray.MenuItem("Unpair Device",         tray_on_unpair),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Quit",                  tray_quit),
+        pystray.MenuItem("Quit",                  tray_on_quit),
     )
     icon = pystray.Icon("PC Control Hub", make_tray_image(), "PC Control Hub", menu)
     tray_ref["icon"] = icon
-    icon.run()
+    icon.run()  # blocks — runs in its own thread
 
 # ─────────────────────────────────────────────
-# QR popup
+# Main-thread UI helpers
 # ─────────────────────────────────────────────
-def show_pair_popup():
-    existing = popup_ref.get("root")
-    if existing:
+def close_popup_if_open():
+    root = popup_ref.get("root")
+    if root:
         try:
-            existing.destroy()
+            root.destroy()
         except:
             pass
+        popup_ref["root"] = None
+
+def show_pair_popup():
+    """Show the QR pairing popup. Must be called from the main thread."""
+    close_popup_if_open()
 
     code = pair_code_ref["code"]
 
@@ -408,32 +362,45 @@ def show_pair_popup():
     remaining = [PAIR_CODE_TTL]
 
     def tick():
+        # Close silently if pairing succeeded
+        if is_paired():
+            root.destroy()
+            return
         remaining[0] -= 1
         if remaining[0] > 0:
             timer_var.set(f"Expires in {remaining[0]}s")
             root.after(1000, tick)
         else:
-            new_code = str(random.randint(100000, 999999))
-            pair_code_ref["code"] = new_code
-            print(f"[AUTO REGENERATE] {new_code}")
-            reregister_pair_code()
-            root.destroy()
-            regenerate_flag["pending"] = True
+            if not is_paired():
+                # Auto-regenerate
+                new_code = str(random.randint(100000, 999999))
+                pair_code_ref["code"] = new_code
+                print(f"[AUTO REGENERATE] {new_code}")
+                threadsafe_send({
+                    "type": "set_pair_code",
+                    "device_id": DEVICE_ID,
+                    "code": new_code
+                })
+                root.destroy()
+                flags["show_qr"] = True
+            else:
+                root.destroy()
 
     root.after(1000, tick)
     root.mainloop()
     popup_ref["root"] = None
 
-# ─────────────────────────────────────────────
-# Unpaired dialog
-# ─────────────────────────────────────────────
-def show_unpaired_dialog():
+def handle_unpaired_dialog():
+    """
+    Show 'You were unpaired' dialog. Main thread only.
+    Yes → show QR. No → offer uninstall.
+    """
     root = tk.Tk()
     root.withdraw()
     repair = messagebox.askyesno(
         "PC Control Hub — Device Unpaired",
         "Your phone has been disconnected from this PC.\n\n"
-        "Would you like to pair it with a new phone?",
+        "Would you like to pair with a new phone?",
         icon="question"
     )
     root.destroy()
@@ -441,7 +408,11 @@ def show_unpaired_dialog():
     if repair:
         new_code = str(random.randint(100000, 999999))
         pair_code_ref["code"] = new_code
-        reregister_pair_code()
+        threadsafe_send({
+            "type": "set_pair_code",
+            "device_id": DEVICE_ID,
+            "code": new_code
+        })
         show_pair_popup()
     else:
         root2 = tk.Tk()
@@ -452,7 +423,6 @@ def show_unpaired_dialog():
             icon="question"
         )
         root2.destroy()
-
         if uninstall:
             root3 = tk.Tk()
             root3.withdraw()
@@ -467,6 +437,63 @@ def show_unpaired_dialog():
         else:
             print("[AGENT] Running unpaired in background.")
 
+def handle_tray_unpair():
+    """
+    Handle unpair request from tray. Main thread only.
+    Confirm → unpair → offer re-pair.
+    """
+    if not is_paired():
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showinfo("PC Control Hub", "This PC is not currently paired to any phone.")
+        root.destroy()
+        return
+
+    root = tk.Tk()
+    root.withdraw()
+    result = messagebox.askyesno(
+        "Unpair Device",
+        "This will disconnect your phone from this PC.\n\nAre you sure you want to unpair?",
+        icon="warning"
+    )
+    root.destroy()
+
+    if not result:
+        return
+
+    # Unpair locally and notify server
+    clear_paired()
+    threadsafe_send({
+        "type": "unpair_from_pc",
+        "device_id": DEVICE_ID
+    })
+    # Re-register so server updates paired_devices
+    threadsafe_send({
+        "type": "register",
+        "device_id": DEVICE_ID,
+        "device_name": DEVICE_NAME,
+        "is_paired": False
+    })
+    print("[TRAY] Unpaired from PC side")
+
+    root2 = tk.Tk()
+    root2.withdraw()
+    again = messagebox.askyesno(
+        "Pair New Device?",
+        "Would you like to pair this PC with a new phone?",
+    )
+    root2.destroy()
+
+    if again:
+        new_code = str(random.randint(100000, 999999))
+        pair_code_ref["code"] = new_code
+        threadsafe_send({
+            "type": "set_pair_code",
+            "device_id": DEVICE_ID,
+            "code": new_code
+        })
+        show_pair_popup()
+
 # ─────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────
@@ -480,26 +507,54 @@ if __name__ == "__main__":
         sys.exit(0)
     signal.signal(signal.SIGINT, handle_sigint)
 
+    # Start WebSocket in background thread
     bg_thread = threading.Thread(target=run_async, daemon=True)
     bg_thread.start()
 
+    # Start tray icon in its own thread
     if TRAY_AVAILABLE:
         tray_thread = threading.Thread(target=start_tray, daemon=True)
         tray_thread.start()
 
     time.sleep(0.8)
 
+    # First run — show QR if not paired
     if not is_paired():
         show_pair_popup()
 
-    print("[AGENT] Running. Check system tray for options.")
+    # ── Main loop — only the main thread handles UI ──
+    print("[AGENT] Running. Right-click the tray icon for options.")
     while True:
-        time.sleep(0.5)
+        time.sleep(0.4)
 
-        if regenerate_flag["pending"]:
-            regenerate_flag["pending"] = False
-            show_pair_popup()
+        if flags["tray_quit"]:
+            flags["tray_quit"] = False
+            print("[EXIT] Quit from tray.")
+            sys.exit(0)
 
-        if unpaired_flag["pending"]:
-            unpaired_flag["pending"] = False
-            show_unpaired_dialog()
+        if flags["close_popup"]:
+            flags["close_popup"] = False
+            close_popup_if_open()
+
+        if flags["show_qr"]:
+            flags["show_qr"] = False
+            if not is_paired():
+                show_pair_popup()
+            else:
+                # Already paired — generate new code and show popup for repair
+                new_code = str(random.randint(100000, 999999))
+                pair_code_ref["code"] = new_code
+                threadsafe_send({
+                    "type": "set_pair_code",
+                    "device_id": DEVICE_ID,
+                    "code": new_code
+                })
+                show_pair_popup()
+
+        if flags["show_unpaired"]:
+            flags["show_unpaired"] = False
+            handle_unpaired_dialog()
+
+        if flags["tray_unpair"]:
+            flags["tray_unpair"] = False
+            handle_tray_unpair()
