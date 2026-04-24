@@ -8,38 +8,36 @@ import logging
 
 logging.getLogger("websockets").setLevel(logging.ERROR)
 
-# -----------------------------
-devices = {}           # device_id -> websocket
+# ─────────────────────────────────────────────
+# State
+# ─────────────────────────────────────────────
+devices        = {}   # device_id -> websocket (PC connections)
 mobile_clients = set()
 dashboard_clients = set()
 
-device_names = {}
+device_names     = {}
 device_last_seen = {}
-device_status = {}
+device_status    = {}
 
-# Pairing: device_id -> { code, expires_at }
-pair_codes = {}
+pair_codes     = {}   # device_id -> { code, expires_at }
+paired_devices = {}   # device_id -> { device_name }  (in-memory, agent owns the file)
 
-# Paired devices: device_id -> { device_name }
-# In production this would be persisted to disk.
-# For testing it just lives in memory.
-paired_devices = {}
+# Pending unpair: if the mobile unpairs a device while the PC is offline,
+# we store it here. When the agent reconnects, we send it immediately.
+pending_unpairs = set()  # set of device_ids
 
-IDLE_THRESHOLD = 10
+IDLE_THRESHOLD    = 10
 OFFLINE_THRESHOLD = 25
-PAIR_CODE_TTL = 120  # seconds before code expires
+PAIR_CODE_TTL     = 120
 
-# -----------------------------
+# ─────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────
 def now_str():
     return time.strftime("%H:%M:%S")
 
 async def send_log(event, data=None):
-    payload = {
-        "type": "server_log",
-        "event": event,
-        "data": data or {},
-        "time": now_str()
-    }
+    payload = {"type": "server_log", "event": event, "data": data or {}, "time": now_str()}
     msg = json.dumps(payload)
     for ws in list(dashboard_clients):
         try:
@@ -47,11 +45,6 @@ async def send_log(event, data=None):
         except:
             dashboard_clients.discard(ws)
 
-# -----------------------------
-def gen_code():
-    return str(random.randint(100000, 999999))
-
-# -----------------------------
 def send_wol(mac: str):
     try:
         print(f"[WOL] Sending magic packet to {mac}")
@@ -66,7 +59,6 @@ def send_wol(mac: str):
         print("[WOL ERROR]", e)
         return False
 
-# -----------------------------
 async def broadcast(payload):
     msg = json.dumps(payload)
     for group in [mobile_clients, dashboard_clients]:
@@ -76,9 +68,8 @@ async def broadcast(payload):
             except:
                 group.discard(ws)
 
-# -----------------------------
 async def update_state(device_id):
-    now = time.time()
+    now  = time.time()
     last = device_last_seen.get(device_id, 0)
 
     if device_id not in devices:
@@ -110,7 +101,6 @@ async def update_state(device_id):
             "last_seen": last
         })
 
-# -----------------------------
 async def send_to_device(device_id, payload):
     ws = devices.get(device_id)
     if not ws:
@@ -127,38 +117,70 @@ async def send_to_device(device_id, payload):
         print("[SEND ERROR]", e)
         return False
 
-# -----------------------------
+# ─────────────────────────────────────────────
+# Unpair helpers
+# ─────────────────────────────────────────────
+async def do_unpair(device_id: str, notify_mobile: bool = True):
+    """
+    Remove pairing for a device.
+    - Notifies the agent (online or queues for next connect).
+    - Notifies all mobile clients to remove the device from their list.
+    """
+    paired_devices.pop(device_id, None)
+    pair_codes.pop(device_id, None)
+
+    # Notify agent — or queue if offline
+    if device_id in devices:
+        await send_to_device(device_id, {"type": "unpaired"})
+        print(f"[UNPAIRED] {device_id} — agent notified")
+    else:
+        pending_unpairs.add(device_id)
+        print(f"[UNPAIRED] {device_id} — agent offline, queued for next connect")
+
+    await send_log("UNPAIRED", {"device_id": device_id})
+
+    # Always tell all mobile clients to remove this device
+    if notify_mobile:
+        await broadcast({
+            "type": "device_removed",
+            "device_id": device_id
+        })
+
+# ─────────────────────────────────────────────
+# Main handler
+# ─────────────────────────────────────────────
 async def handler(ws):
-    device_id = None
+    device_id   = None
     client_type = None
 
     try:
         async for msg in ws:
             print("[RAW MESSAGE]", msg)
-            data = json.loads(msg)
+            data     = json.loads(msg)
             msg_type = data.get("type")
 
             await send_log("MESSAGE_RECEIVED", {"type": msg_type})
 
             # ── PC REGISTRATION ──
             if msg_type == "register":
-                device_id = data["device_id"]
+                device_id   = data["device_id"]
                 client_type = "pc"
-                devices[device_id] = ws
+                devices[device_id]          = ws
                 device_last_seen[device_id] = time.time()
-                device_names[device_id] = data.get("device_name", "Unknown-PC")
-
-                # Store/update paired device info
-                paired_devices[device_id] = {
-                    "device_name": device_names[device_id]
-                }
+                device_names[device_id]     = data.get("device_name", "Unknown-PC")
+                paired_devices[device_id]   = {"device_name": device_names[device_id]}
 
                 print(f"[PC CONNECTED] {device_id} ({device_names[device_id]})")
-                await send_log("PC_CONNECTED", {
-                    "device_id": device_id,
-                    "device_name": device_names[device_id]
-                })
-                await update_state(device_id)
+                await send_log("PC_CONNECTED", {"device_id": device_id, "device_name": device_names[device_id]})
+
+                # Deliver any pending unpair that happened while PC was offline
+                if device_id in pending_unpairs:
+                    pending_unpairs.discard(device_id)
+                    print(f"[PENDING UNPAIR] Delivering to {device_id}")
+                    await send_to_device(device_id, {"type": "unpaired"})
+                    # Don't call update_state — device is being unpaired
+                else:
+                    await update_state(device_id)
 
             # ── HEARTBEAT ──
             elif msg_type == "heartbeat":
@@ -175,7 +197,7 @@ async def handler(ws):
                 print("[MOBILE CONNECTED]")
                 await send_log("MOBILE_CONNECTED")
 
-                # Send current state of all known devices to this new mobile client
+                # Push current state of all known devices
                 for dev_id, status in device_status.items():
                     try:
                         await ws.send(json.dumps({
@@ -195,88 +217,92 @@ async def handler(ws):
                 print("[DASHBOARD CONNECTED]")
                 await send_log("DASHBOARD_CONNECTED")
 
-            # ── PAIRING: MOBILE REQUESTS CODE FOR A DEVICE ──
-            # The agent calls this on behalf of the device when it generates a code.
-            # We store it here so the mobile can validate against it.
+            # ── PAIRING: AGENT REGISTERS ITS CODE ──
             elif msg_type == "set_pair_code":
                 dev_id = data.get("device_id")
-                code = data.get("code")
+                code   = data.get("code")
                 if dev_id and code:
                     pair_codes[dev_id] = {
                         "code": code,
                         "expires_at": time.time() + PAIR_CODE_TTL
                     }
-                    print(f"[PAIR CODE SET] {dev_id} → {code} (expires in {PAIR_CODE_TTL}s)")
+                    print(f"[PAIR CODE SET] {dev_id} → {code}")
                     await send_log("PAIR_CODE_SET", {"device_id": dev_id})
 
             # ── PAIRING: MOBILE SUBMITS CODE ──
             elif msg_type == "pair":
-                submitted_code = data.get("code")
-                device_name_from_scan = data.get("device_name", "Unknown-PC")
+                submitted_code = data.get("code", "").replace(" ", "")
 
-                # Find the device whose code matches
                 matched_id = None
                 for dev_id, entry in list(pair_codes.items()):
                     if entry["code"] == submitted_code:
                         if time.time() < entry["expires_at"]:
                             matched_id = dev_id
                         else:
-                            # Code expired — clean it up
                             del pair_codes[dev_id]
                             print(f"[PAIR EXPIRED] {dev_id}")
                         break
 
                 if matched_id:
-                    # Success — remove code so it can't be reused
-                    del pair_codes[matched_id]
+                    # Check if this device is already paired
+                    if matched_id in paired_devices:
+                        # Already paired — tell mobile
+                        await ws.send(json.dumps({
+                            "type": "pair_error",
+                            "message": "This PC is already paired to a device. Please unpair it first from the PC agent before pairing again."
+                        }))
+                        print(f"[PAIR BLOCKED] {matched_id} already paired")
+                    else:
+                        del pair_codes[matched_id]
+                        paired_devices[matched_id] = {
+                            "device_name": device_names.get(matched_id, "Unknown-PC")
+                        }
+                        print(f"[PAIRED] {matched_id}")
+                        await send_log("PAIRED", {"device_id": matched_id})
 
-                    paired_devices[matched_id] = {
-                        "device_name": device_names.get(matched_id, device_name_from_scan)
-                    }
+                        # Tell agent to save paired.json
+                        await send_to_device(matched_id, {"type": "pair_confirmed"})
 
-                    print(f"[PAIRED] {matched_id} with mobile")
-                    await send_log("PAIRED", {"device_id": matched_id})
-
-                    await ws.send(json.dumps({
-                        "type": "pair_success",
-                        "device_id": matched_id,
-                        "device_name": device_names.get(matched_id, device_name_from_scan),
-                        "status": device_status.get(matched_id, "offline"),
-                        "last_seen": device_last_seen.get(matched_id, 0)
-                    }))
+                        await ws.send(json.dumps({
+                            "type": "pair_success",
+                            "device_id": matched_id,
+                            "device_name": device_names.get(matched_id, "Unknown-PC"),
+                            "status": device_status.get(matched_id, "offline"),
+                            "last_seen": device_last_seen.get(matched_id, 0)
+                        }))
                 else:
-                    print(f"[PAIR FAILED] Invalid or expired code: {submitted_code}")
+                    print(f"[PAIR FAILED] Invalid/expired code: {submitted_code}")
                     await send_log("PAIR_FAILED", {"code": submitted_code})
                     await ws.send(json.dumps({
                         "type": "pair_error",
                         "message": "Invalid or expired code. Please generate a new one on your PC."
                     }))
 
+            # ── UNPAIR: MOBILE REMOVES DEVICE ──
+            elif msg_type == "unpair_device":
+                target_id = data.get("device_id")
+                if target_id:
+                    await do_unpair(target_id, notify_mobile=False)
+
+            # ── UNPAIR: PC AGENT UNPAIRING FROM ITS SIDE ──
+            elif msg_type == "unpair_from_pc":
+                target_id = data.get("device_id")
+                if target_id:
+                    await do_unpair(target_id, notify_mobile=True)
+
             # ── COMMANDS ──
             elif msg_type in ["shutdown_pc", "restart_pc", "lock_pc"]:
-                target_id = data.get("device_id")
-                await send_to_device(target_id, {
-                    "type": msg_type,
-                    "data": {}
-                })
+                await send_to_device(data.get("device_id"), {"type": msg_type, "data": {}})
 
             elif msg_type == "wake_pc":
                 target_id = data.get("device_id")
-                mac = data.get("mac")
-
+                mac       = data.get("mac")
                 print(f"[WAKE COMMAND] device={target_id} mac={mac}")
                 await send_log("WOL_TRIGGERED", {"device_id": target_id})
-
                 if mac:
                     success = send_wol(mac)
                 else:
-                    # Fall back to sending wake command to the agent itself
-                    # (agent has the MAC stored locally)
-                    success = await send_to_device(target_id, {
-                        "type": "wake_pc",
-                        "data": {}
-                    })
-
+                    success = await send_to_device(target_id, {"type": "wake_pc", "data": {}})
                 await send_log("WOL_RESULT", {"success": success})
 
     except Exception as e:
@@ -295,14 +321,13 @@ async def handler(ws):
         if client_type == "dashboard":
             dashboard_clients.discard(ws)
 
-# -----------------------------
+# ─────────────────────────────────────────────
 async def state_monitor():
     while True:
         for dev in list(device_last_seen.keys()):
             await update_state(dev)
         await asyncio.sleep(3)
 
-# -----------------------------
 async def main():
     print("[SERVER STARTED] ws://0.0.0.0:8000")
     async with websockets.serve(handler, "0.0.0.0", 8000):

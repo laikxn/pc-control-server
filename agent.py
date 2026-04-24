@@ -1,13 +1,13 @@
 """
 PC Control Hub — Agent
-Run this on your Windows PC. It will:
-  1. Generate a 6-digit pairing code
-  2. Show a small popup with the QR code + plain code
-  3. Connect to the server in the background
-  4. Listen for and execute commands (shutdown, restart, lock, wake)
+Runs silently on your Windows PC after first pairing.
 
-Install dependencies before first run:
-    pip install websockets qrcode pillow
+Install dependencies:
+    pip install websockets qrcode pillow pystray
+
+First run: shows QR popup for pairing.
+After pairing: runs silently in system tray.
+Tray options: Pair New Device | Unpair Device | Quit
 """
 
 import asyncio
@@ -19,25 +19,34 @@ import os
 import socket
 import threading
 import random
+import signal
+import sys
 import tkinter as tk
-from tkinter import font as tkfont
+from tkinter import font as tkfont, messagebox
 from io import BytesIO
 
 try:
     import qrcode
-    from PIL import Image, ImageTk
+    from PIL import Image, ImageTk, ImageDraw
     QR_AVAILABLE = True
 except ImportError:
     QR_AVAILABLE = False
     print("[WARN] qrcode/pillow not installed. Run: pip install qrcode pillow")
-    print("[WARN] Pairing popup will show text code only.")
+
+try:
+    import pystray
+    TRAY_AVAILABLE = True
+except ImportError:
+    TRAY_AVAILABLE = False
+    print("[WARN] pystray not installed. Run: pip install pystray")
 
 # ─────────────────────────────────────────────
-# Config — change SERVER_URL when moving to cloud
+# Config
 # ─────────────────────────────────────────────
-SERVER_URL = "ws://192.168.1.230:8000"
+SERVER_URL     = "ws://192.168.1.230:8000"
 DEVICE_ID_FILE = "device_id.txt"
-PAIR_CODE_TTL = 120  # seconds
+PAIRED_FILE    = "paired.json"
+PAIR_CODE_TTL  = 120
 
 # ─────────────────────────────────────────────
 # Device identity
@@ -54,209 +63,78 @@ def get_device_id():
 def get_device_name():
     return os.environ.get("COMPUTERNAME", socket.gethostname())
 
-def get_local_ip():
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except:
-        return "127.0.0.1"
-
-DEVICE_ID = get_device_id()
+DEVICE_ID   = get_device_id()
 DEVICE_NAME = get_device_name()
-LOCAL_IP = get_local_ip()
 
 # ─────────────────────────────────────────────
-# Pairing code
+# Paired state — persisted to paired.json
 # ─────────────────────────────────────────────
-def gen_pair_code():
-    return str(random.randint(100000, 999999))
+def is_paired():
+    if not os.path.exists(PAIRED_FILE):
+        return False
+    try:
+        with open(PAIRED_FILE, "r") as f:
+            data = json.load(f)
+        return data.get("paired", False)
+    except:
+        return False
 
-PAIR_CODE = gen_pair_code()
-pair_code_expiry = time.time() + PAIR_CODE_TTL
+def save_paired(paired: bool):
+    with open(PAIRED_FILE, "w") as f:
+        json.dump({"paired": paired}, f)
 
-# Shared websocket ref so the popup can send the code to the server
-ws_ref = {"ws": None}
+def clear_paired():
+    save_paired(False)
+
+# ─────────────────────────────────────────────
+# Pairing state
+# ─────────────────────────────────────────────
+pair_code_ref   = {"code": str(random.randint(100000, 999999))}
+popup_ref       = {"root": None}
+regenerate_flag = {"pending": False}
+# Set to True when the server sends "unpaired" so main thread can show dialog
+unpaired_flag   = {"pending": False}
+loop_ref        = {"loop": None}
+ws_ref          = {"ws": None}
+tray_ref        = {"icon": None}
 
 # ─────────────────────────────────────────────
 # PC commands
 # ─────────────────────────────────────────────
 def shutdown_pc():
-    print("[ACTION] Shutdown triggered")
+    print("[ACTION] Shutdown")
     os.system("shutdown /s /t 0")
 
 def restart_pc():
-    print("[ACTION] Restart triggered")
+    print("[ACTION] Restart")
     os.system("shutdown /r /t 0")
 
 def lock_pc():
-    print("[ACTION] Lock triggered")
+    print("[ACTION] Lock")
     os.system("rundll32.exe user32.dll,LockWorkStation")
 
 def wake_on_lan(mac: str):
     try:
-        print(f"[WOL] Sending magic packet to {mac}")
         mac_bytes = bytes.fromhex(mac.replace(":", "").replace("-", ""))
         packet = b"\xff" * 6 + mac_bytes * 16
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
             s.sendto(packet, ("255.255.255.255", 9))
-        print("[WOL] Sent successfully")
+        print("[WOL] Sent")
     except Exception as e:
         print("[WOL ERROR]", e)
 
 # ─────────────────────────────────────────────
-# Pairing popup (tkinter, runs on main thread)
-# ─────────────────────────────────────────────
-def show_pair_popup(code: str, ip: str, port: int = 8000):
-    """Show a small window with the pairing QR code and manual code."""
-
-    root = tk.Tk()
-    root.title("PC Control Hub — Pair Device")
-    root.configure(bg="#1a1a2e")
-    root.resizable(False, False)
-
-    # Center on screen
-    w, h = 340, 480 if QR_AVAILABLE else 280
-    sw = root.winfo_screenwidth()
-    sh = root.winfo_screenheight()
-    root.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
-
-    # Keep window on top
-    root.attributes("-topmost", True)
-
-    title_font = tkfont.Font(family="Segoe UI", size=13, weight="bold")
-    body_font  = tkfont.Font(family="Segoe UI", size=10)
-    code_font  = tkfont.Font(family="Courier New", size=28, weight="bold")
-    small_font = tkfont.Font(family="Segoe UI", size=8)
-
-    tk.Label(
-        root,
-        text="PC Control Hub",
-        font=title_font,
-        bg="#1a1a2e",
-        fg="#ffffff"
-    ).pack(pady=(18, 2))
-
-    tk.Label(
-        root,
-        text="Scan this QR code or enter the\nmanual code in the app to pair your phone.",
-        font=body_font,
-        bg="#1a1a2e",
-        fg="#aaaaaa",
-        justify="center"
-    ).pack(pady=(0, 10))
-
-    # QR code image
-    if QR_AVAILABLE:
-        qr_data = json.dumps({"ip": ip, "port": port, "code": code})
-        qr = qrcode.QRCode(
-            version=2,
-            error_correction=qrcode.constants.ERROR_CORRECT_M,
-            box_size=6,
-            border=3
-        )
-        qr.add_data(qr_data)
-        qr.make(fit=True)
-        qr_img = qr.make_image(fill_color="black", back_color="white")
-
-        # Convert to tkinter-compatible image
-        buf = BytesIO()
-        qr_img.save(buf, format="PNG")
-        buf.seek(0)
-        pil_img = Image.open(buf).resize((200, 200), Image.NEAREST)
-        tk_img = ImageTk.PhotoImage(pil_img)
-
-        qr_frame = tk.Frame(root, bg="white", padx=4, pady=4)
-        qr_frame.pack(pady=(0, 10))
-        tk.Label(qr_frame, image=tk_img, bg="white").pack()
-        root._qr_img = tk_img  # prevent garbage collection
-
-    # Manual code display
-    tk.Label(
-        root,
-        text="Manual Code",
-        font=body_font,
-        bg="#1a1a2e",
-        fg="#aaaaaa"
-    ).pack()
-
-    code_frame = tk.Frame(root, bg="#0f3460", padx=16, pady=10)
-    code_frame.pack(pady=(4, 8))
-    tk.Label(
-        code_frame,
-        text=code,
-        font=code_font,
-        bg="#0f3460",
-        fg="#e94560",
-        letter_spacing=8
-    ).pack()
-
-    # Timer label
-    timer_var = tk.StringVar(value=f"Expires in {PAIR_CODE_TTL}s")
-    tk.Label(
-        root,
-        textvariable=timer_var,
-        font=small_font,
-        bg="#1a1a2e",
-        fg="#666688"
-    ).pack()
-
-    # IP info
-    tk.Label(
-        root,
-        text=f"Your PC IP: {ip}:{port}",
-        font=small_font,
-        bg="#1a1a2e",
-        fg="#555577"
-    ).pack(pady=(4, 0))
-
-    # Close button
-    tk.Button(
-        root,
-        text="Close",
-        font=body_font,
-        bg="#333355",
-        fg="white",
-        relief="flat",
-        padx=20,
-        pady=6,
-        command=root.destroy
-    ).pack(pady=(12, 16))
-
-    # Countdown timer
-    remaining = [PAIR_CODE_TTL]
-
-    def tick():
-        remaining[0] -= 1
-        if remaining[0] > 0:
-            timer_var.set(f"Expires in {remaining[0]}s")
-            root.after(1000, tick)
-        else:
-            timer_var.set("Code expired — restart app to generate new code")
-
-    root.after(1000, tick)
-    root.mainloop()
-
-
-# ─────────────────────────────────────────────
-# WebSocket: send the code to the server
+# WebSocket
 # ─────────────────────────────────────────────
 async def register_pair_code(ws):
-    """Tell the server about our pairing code so it can validate mobile requests."""
     await ws.send(json.dumps({
         "type": "set_pair_code",
         "device_id": DEVICE_ID,
-        "code": PAIR_CODE
+        "code": pair_code_ref["code"]
     }))
-    print(f"[PAIR CODE REGISTERED] {PAIR_CODE} (valid {PAIR_CODE_TTL}s)")
+    print(f"[PAIR CODE REGISTERED] {pair_code_ref['code']}")
 
-
-# ─────────────────────────────────────────────
-# WebSocket: heartbeat
-# ─────────────────────────────────────────────
 async def send_heartbeat(ws):
     while True:
         try:
@@ -271,19 +149,12 @@ async def send_heartbeat(ws):
             print("[HEARTBEAT ERROR]", e)
             break
 
-
-# ─────────────────────────────────────────────
-# WebSocket: command handler
-# ─────────────────────────────────────────────
 async def handle_command(cmd, ws):
-    t = cmd.get("type")
+    t      = cmd.get("type")
     cmd_id = cmd.get("command_id")
-
     if not t:
         return
-
-    print(f"[COMMAND RECEIVED] {t}")
-
+    print(f"[COMMAND] {t}")
     try:
         if t == "shutdown_pc":
             shutdown_pc()
@@ -297,6 +168,15 @@ async def handle_command(cmd, ws):
                 wake_on_lan(mac)
         elif t == "reload_agent":
             os._exit(0)
+        elif t == "pair_confirmed":
+            # Server confirmed pairing — save locally
+            save_paired(True)
+            print("[PAIRED] Saved to paired.json")
+        elif t == "unpaired":
+            # Mobile removed this device
+            clear_paired()
+            print("[UNPAIRED] Received from server")
+            unpaired_flag["pending"] = True
 
         if cmd_id:
             await ws.send(json.dumps({
@@ -304,14 +184,9 @@ async def handle_command(cmd, ws):
                 "command_id": cmd_id,
                 "status": "executed"
             }))
-
     except Exception as e:
         print("[COMMAND ERROR]", e)
 
-
-# ─────────────────────────────────────────────
-# Main connection loop
-# ─────────────────────────────────────────────
 async def connect():
     while True:
         try:
@@ -325,14 +200,15 @@ async def connect():
                     "device_name": DEVICE_NAME
                 }))
 
-                # Register our pairing code with the server
-                await register_pair_code(ws)
+                # Only register pair code if not yet paired
+                if not is_paired():
+                    await register_pair_code(ws)
 
                 heartbeat_task = asyncio.create_task(send_heartbeat(ws))
 
                 while True:
                     try:
-                        msg = await ws.recv()
+                        msg  = await ws.recv()
                         data = json.loads(msg)
                         await handle_command(data, ws)
                     except websockets.ConnectionClosed:
@@ -348,32 +224,260 @@ async def connect():
         ws_ref["ws"] = None
         await asyncio.sleep(3)
 
+def run_async():
+    loop = asyncio.new_event_loop()
+    loop_ref["loop"] = loop
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(connect())
+
+def reregister_pair_code():
+    ws   = ws_ref.get("ws")
+    loop = loop_ref.get("loop")
+    if ws and loop and not loop.is_closed():
+        asyncio.run_coroutine_threadsafe(register_pair_code(ws), loop)
+
+def send_unpair_to_server():
+    """Tell the server that this PC is unpairing itself."""
+    ws   = ws_ref.get("ws")
+    loop = loop_ref.get("loop")
+    if ws and loop and not loop.is_closed():
+        async def _send():
+            await ws.send(json.dumps({
+                "type": "unpair_from_pc",
+                "device_id": DEVICE_ID
+            }))
+        asyncio.run_coroutine_threadsafe(_send(), loop)
+
+# ─────────────────────────────────────────────
+# Tray icon
+# ─────────────────────────────────────────────
+def make_tray_image():
+    """Create a simple coloured circle as the tray icon."""
+    img  = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.ellipse([4, 4, 60, 60], fill="#22c55e")
+    return img
+
+def tray_pair_device(icon, item):
+    """Triggered from tray: open QR popup regardless of paired state."""
+    new_code = str(random.randint(100000, 999999))
+    pair_code_ref["code"] = new_code
+    reregister_pair_code()
+    regenerate_flag["pending"] = True
+
+def tray_unpair_device(icon, item):
+    """Triggered from tray: unpair and notify server + mobile."""
+    if not is_paired():
+        return
+    result = messagebox.askyesno(
+        "Unpair Device",
+        "This will disconnect your phone from this PC.\n\nAre you sure you want to unpair?",
+        icon="warning"
+    )
+    if result:
+        clear_paired()
+        send_unpair_to_server()
+        print("[TRAY] Unpaired from PC side")
+        # Ask if they want to pair with a new phone
+        again = messagebox.askyesno(
+            "Pair New Device?",
+            "Would you like to pair this PC with a new phone?",
+        )
+        if again:
+            new_code = str(random.randint(100000, 999999))
+            pair_code_ref["code"] = new_code
+            reregister_pair_code()
+            regenerate_flag["pending"] = True
+
+def tray_quit(icon, item):
+    icon.stop()
+    sys.exit(0)
+
+def start_tray():
+    if not TRAY_AVAILABLE:
+        return
+    menu = pystray.Menu(
+        pystray.MenuItem("Pair / Repair Device", tray_pair_device),
+        pystray.MenuItem("Unpair Device",         tray_unpair_device),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Quit",                  tray_quit),
+    )
+    icon = pystray.Icon("PC Control Hub", make_tray_image(), "PC Control Hub", menu)
+    tray_ref["icon"] = icon
+    icon.run()   # blocks — run in its own thread
+
+# ─────────────────────────────────────────────
+# QR popup
+# ─────────────────────────────────────────────
+def show_pair_popup():
+    existing = popup_ref.get("root")
+    if existing:
+        try:
+            existing.destroy()
+        except:
+            pass
+
+    code = pair_code_ref["code"]
+
+    root = tk.Tk()
+    popup_ref["root"] = root
+    root.title("PC Control Hub — Pair Device")
+    root.configure(bg="#1a1a2e")
+    root.resizable(False, False)
+
+    w  = 340
+    h  = 480 if QR_AVAILABLE else 280
+    sw = root.winfo_screenwidth()
+    sh = root.winfo_screenheight()
+    root.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+    root.attributes("-topmost", True)
+
+    title_font = tkfont.Font(family="Segoe UI", size=13, weight="bold")
+    body_font  = tkfont.Font(family="Segoe UI", size=10)
+    code_font  = tkfont.Font(family="Courier New", size=30, weight="bold")
+    small_font = tkfont.Font(family="Segoe UI", size=8)
+
+    tk.Label(root, text="PC Control Hub", font=title_font, bg="#1a1a2e", fg="#ffffff").pack(pady=(18, 2))
+    tk.Label(
+        root,
+        text="Scan the QR code or enter the manual\ncode in the app to pair your phone.",
+        font=body_font, bg="#1a1a2e", fg="#aaaaaa", justify="center"
+    ).pack(pady=(0, 10))
+
+    if QR_AVAILABLE:
+        qr_data = json.dumps({"server": SERVER_URL, "code": code})
+        qr = qrcode.QRCode(version=2, error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=6, border=3)
+        qr.add_data(qr_data)
+        qr.make(fit=True)
+        qr_img = qr.make_image(fill_color="black", back_color="white")
+        buf = BytesIO()
+        qr_img.save(buf, format="PNG")
+        buf.seek(0)
+        pil_img = Image.open(buf).resize((200, 200), Image.NEAREST)
+        tk_img  = ImageTk.PhotoImage(pil_img)
+        qr_frame = tk.Frame(root, bg="white", padx=4, pady=4)
+        qr_frame.pack(pady=(0, 10))
+        tk.Label(qr_frame, image=tk_img, bg="white").pack()
+        root._qr_img = tk_img
+
+    tk.Label(root, text="Manual Code", font=body_font, bg="#1a1a2e", fg="#aaaaaa").pack()
+    code_frame = tk.Frame(root, bg="#0f3460", padx=16, pady=10)
+    code_frame.pack(pady=(4, 8))
+    spaced = f"{code[:3]} {code[3:]}"
+    tk.Label(code_frame, text=spaced, font=code_font, bg="#0f3460", fg="#e94560").pack()
+
+    timer_var = tk.StringVar(value=f"Expires in {PAIR_CODE_TTL}s")
+    tk.Label(root, textvariable=timer_var, font=small_font, bg="#1a1a2e", fg="#666688").pack()
+    tk.Label(root, text=f"Server: {SERVER_URL}", font=small_font, bg="#1a1a2e", fg="#555577").pack(pady=(4, 0))
+
+    remaining = [PAIR_CODE_TTL]
+
+    def tick():
+        remaining[0] -= 1
+        if remaining[0] > 0:
+            timer_var.set(f"Expires in {remaining[0]}s")
+            root.after(1000, tick)
+        else:
+            new_code = str(random.randint(100000, 999999))
+            pair_code_ref["code"] = new_code
+            print(f"[AUTO REGENERATE] {new_code}")
+            reregister_pair_code()
+            root.destroy()
+            regenerate_flag["pending"] = True
+
+    root.after(1000, tick)
+    root.mainloop()
+    popup_ref["root"] = None
+
+# ─────────────────────────────────────────────
+# Unpaired dialog — shown when mobile removes device
+# ─────────────────────────────────────────────
+def show_unpaired_dialog():
+    """
+    Called on the main thread when the server tells us the mobile unpaired us.
+    Shows: "Your device has been unpaired. Repair?"
+    Yes → QR popup.  No → offer uninstall.
+    """
+    root = tk.Tk()
+    root.withdraw()  # hide root window, just use dialogs
+
+    repair = messagebox.askyesno(
+        "PC Control Hub — Device Unpaired",
+        "Your phone has been disconnected from this PC.\n\n"
+        "Would you like to pair it with a new phone?",
+        icon="question"
+    )
+    root.destroy()
+
+    if repair:
+        new_code = str(random.randint(100000, 999999))
+        pair_code_ref["code"] = new_code
+        reregister_pair_code()
+        show_pair_popup()
+    else:
+        # Offer uninstall
+        root2 = tk.Tk()
+        root2.withdraw()
+        uninstall = messagebox.askyesno(
+            "PC Control Hub",
+            "Would you like to uninstall PC Control Hub from this PC?",
+            icon="question"
+        )
+        root2.destroy()
+
+        if uninstall:
+            # Show thank you, then exit (actual uninstall would be handled by installer)
+            root3 = tk.Tk()
+            root3.withdraw()
+            messagebox.showinfo(
+                "PC Control Hub",
+                "Thank you for using PC Control Hub!\n\n"
+                "The application will now close.\n"
+                "You can uninstall it from Windows Settings → Apps."
+            )
+            root3.destroy()
+            sys.exit(0)
+        else:
+            # Just close — run silently, unpaired
+            print("[AGENT] Running unpaired in background.")
 
 # ─────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────
-def run_async():
-    """Run the asyncio event loop in a background thread."""
-    asyncio.run(connect())
-
-
 if __name__ == "__main__":
-    print(f"[AGENT] Device: {DEVICE_NAME} ({DEVICE_ID})")
-    print(f"[AGENT] Local IP: {LOCAL_IP}")
-    print(f"[AGENT] Pair code: {PAIR_CODE}")
+    print(f"[AGENT] Device:    {DEVICE_NAME} ({DEVICE_ID})")
+    print(f"[AGENT] Server:    {SERVER_URL}")
+    print(f"[AGENT] Paired:    {is_paired()}")
 
-    # Start WebSocket connection in background thread
+    def handle_sigint(sig, frame):
+        print("\n[EXIT] Agent stopped.")
+        sys.exit(0)
+    signal.signal(signal.SIGINT, handle_sigint)
+
+    # Start WebSocket in background
     bg_thread = threading.Thread(target=run_async, daemon=True)
     bg_thread.start()
 
-    # Show pairing popup on the main thread (tkinter requirement)
-    show_pair_popup(PAIR_CODE, LOCAL_IP)
+    # Start tray icon in its own thread
+    if TRAY_AVAILABLE:
+        tray_thread = threading.Thread(target=start_tray, daemon=True)
+        tray_thread.start()
 
-    # After popup is closed, keep running silently in the background
-    print("[AGENT] Running in background. Close this window to stop.")
+    time.sleep(0.8)
 
-    # Keep main thread alive so daemon thread keeps running
-    try:
-        bg_thread.join()
-    except KeyboardInterrupt:
-        print("\n[EXIT] Agent stopped.")
+    # First run — not yet paired → show QR popup
+    if not is_paired():
+        show_pair_popup()
+
+    # Main loop — watch for flags
+    print("[AGENT] Running. Check system tray for options.")
+    while True:
+        time.sleep(0.5)
+
+        if regenerate_flag["pending"]:
+            regenerate_flag["pending"] = False
+            show_pair_popup()
+
+        if unpaired_flag["pending"]:
+            unpaired_flag["pending"] = False
+            show_unpaired_dialog()
