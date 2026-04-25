@@ -86,8 +86,26 @@ def get_device_id():
 def get_device_name():
     return os.environ.get("COMPUTERNAME", socket.gethostname())
 
+def get_device_mac() -> str:
+    """
+    Read this machine's primary MAC address using uuid.getnode().
+    Returns a colon-separated uppercase string like AA:BB:CC:DD:EE:FF.
+    Falls back to '00:00:00:00:00:00' on any error.
+    """
+    try:
+        raw = uuid.getnode()
+        # uuid.getnode() can return a random value if it can't find a real MAC;
+        # the multicast bit (LSB of first octet) is set in that case.
+        mac_bytes = raw.to_bytes(6, "big")
+        mac_str   = ":".join(f"{b:02X}" for b in mac_bytes)
+        return mac_str
+    except Exception as e:
+        print("[MAC ERROR]", e)
+        return "00:00:00:00:00:00"
+
 DEVICE_ID   = get_device_id()
 DEVICE_NAME = get_device_name()
+DEVICE_MAC  = get_device_mac()
 
 # ─────────────────────────────────────────────
 # Paired state
@@ -156,20 +174,67 @@ def get_gpu_stats():
             pass
     return None, None
 
+def get_disk_stats() -> list:
+    """
+    Returns a list of dicts for each real local drive:
+      [{ label, used_gb, total_gb, percent }, ...]
+
+    Filters out optical drives, network mounts, and any partition
+    that raises an error (e.g. empty CD tray).
+    """
+    if not PSUTIL_AVAILABLE:
+        return []
+
+    EXCLUDED_FSTYPES = {"cdrom", "udf", "iso9660", "squashfs", "tmpfs",
+                        "devtmpfs", "devfs", "overlay", "proc", "sysfs"}
+    EXCLUDED_OPTS    = {"cdrom", "remote"}
+
+    disks = []
+    try:
+        partitions = psutil.disk_partitions(all=False)
+        for part in partitions:
+            # Skip optical / network / virtual filesystems
+            if part.fstype.lower() in EXCLUDED_FSTYPES:
+                continue
+            if any(opt in part.opts.lower() for opt in EXCLUDED_OPTS):
+                continue
+            # Windows: only include drive letters (e.g. C:\, D:\)
+            # Linux/Mac: include normal mount points
+            try:
+                usage = psutil.disk_usage(part.mountpoint)
+            except (PermissionError, OSError):
+                continue
+
+            # Build a friendly label: prefer drive letter on Windows,
+            # mountpoint on Linux/Mac
+            if os.name == "nt":
+                label = part.device.rstrip("\\").rstrip("/")  # e.g. "C:"
+            else:
+                label = part.mountpoint  # e.g. "/"
+
+            disks.append({
+                "label":    label,
+                "used_gb":  round(usage.used  / (1024 ** 3), 1),
+                "total_gb": round(usage.total / (1024 ** 3), 1),
+                "percent":  round(usage.percent, 1),
+            })
+    except Exception as e:
+        print("[DISK ERROR]", e)
+
+    return disks
+
 def collect_stats() -> dict:
     """Collect system stats. Returns dict ready to send."""
     stats = {
-        "device_id": DEVICE_ID,
+        "device_id":   DEVICE_ID,
         "cpu_percent": None,
-        "cpu_temp": None,
+        "cpu_temp":    None,
         "ram_used_gb": None,
-        "ram_total_gb": None,
+        "ram_total_gb":None,
         "ram_percent": None,
-        "disk_used_gb": None,
-        "disk_total_gb": None,
-        "disk_percent": None,
+        "disks":       [],        # replaces single disk_* fields
         "gpu_percent": None,
-        "gpu_temp": None,
+        "gpu_temp":    None,
     }
 
     if not PSUTIL_AVAILABLE:
@@ -199,13 +264,8 @@ def collect_stats() -> dict:
     except:
         pass
 
-    try:
-        disk = psutil.disk_usage("C:\\")
-        stats["disk_used_gb"]  = round(disk.used  / (1024 ** 3), 1)
-        stats["disk_total_gb"] = round(disk.total / (1024 ** 3), 1)
-        stats["disk_percent"]  = round(disk.percent, 1)
-    except:
-        pass
+    # Multi-disk
+    stats["disks"] = get_disk_stats()
 
     try:
         gpu_pct, gpu_temp = get_gpu_stats()
@@ -260,16 +320,17 @@ def threadsafe_send(payload: dict):
 
 async def _register_and_code(ws):
     await ws.send(json.dumps({
-        "type": "register",
-        "device_id": DEVICE_ID,
+        "type":        "register",
+        "device_id":   DEVICE_ID,
         "device_name": DEVICE_NAME,
-        "is_paired": is_paired()
+        "device_mac":  DEVICE_MAC,
+        "is_paired":   is_paired()
     }))
     if not is_paired():
         await ws.send(json.dumps({
-            "type": "set_pair_code",
+            "type":      "set_pair_code",
             "device_id": DEVICE_ID,
-            "code": pair_code_ref["code"]
+            "code":      pair_code_ref["code"]
         }))
         print(f"[PAIR CODE REGISTERED] {pair_code_ref['code']}")
 
@@ -283,7 +344,7 @@ async def send_heartbeat(ws):
     while True:
         try:
             await ws.send(json.dumps({
-                "type": "heartbeat",
+                "type":      "heartbeat",
                 "device_id": DEVICE_ID,
                 "timestamp": time.time()
             }))
@@ -341,9 +402,9 @@ async def handle_command(cmd, ws):
 
         if cmd_id:
             await ws.send(json.dumps({
-                "type": "ack",
+                "type":       "ack",
                 "command_id": cmd_id,
-                "status": "executed"
+                "status":     "executed"
             }))
     except Exception as e:
         print("[COMMAND ERROR]", e)
@@ -356,17 +417,18 @@ async def connect():
                 print("[CONNECTED]")
 
                 await ws.send(json.dumps({
-                    "type": "register",
-                    "device_id": DEVICE_ID,
+                    "type":        "register",
+                    "device_id":   DEVICE_ID,
                     "device_name": DEVICE_NAME,
-                    "is_paired": is_paired()
+                    "device_mac":  DEVICE_MAC,
+                    "is_paired":   is_paired()
                 }))
 
                 if not is_paired() and pair_code_ref["code"]:
                     await ws.send(json.dumps({
-                        "type": "set_pair_code",
+                        "type":      "set_pair_code",
                         "device_id": DEVICE_ID,
-                        "code": pair_code_ref["code"]
+                        "code":      pair_code_ref["code"]
                     }))
                     print(f"[PAIR CODE REGISTERED] {pair_code_ref['code']}")
 
@@ -504,10 +566,11 @@ def _do_unpair_and_notify():
     clear_paired()
     threadsafe_send({"type": "unpair_from_pc", "device_id": DEVICE_ID})
     threadsafe_send({
-        "type": "register",
-        "device_id": DEVICE_ID,
+        "type":        "register",
+        "device_id":   DEVICE_ID,
         "device_name": DEVICE_NAME,
-        "is_paired": False
+        "device_mac":  DEVICE_MAC,
+        "is_paired":   False
     })
     print("[AGENT] Unpaired and notified server")
 
@@ -657,6 +720,7 @@ def handle_tray_unpair():
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
     print(f"[AGENT] Device:    {DEVICE_NAME} ({DEVICE_ID})")
+    print(f"[AGENT] MAC:       {DEVICE_MAC}")
     print(f"[AGENT] Server:    {SERVER_URL}")
     print(f"[AGENT] Paired:    {is_paired()}")
     print(f"[AGENT] psutil:    {PSUTIL_AVAILABLE}")
