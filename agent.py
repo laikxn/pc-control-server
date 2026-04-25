@@ -3,14 +3,12 @@ PC Control Hub — Agent
 Runs silently on your Windows PC after first pairing.
 
 Install dependencies:
-    pip install websockets qrcode pillow pystray
+    pip install websockets qrcode pillow pystray psutil
+    pip install GPUtil  (optional, Nvidia GPU stats)
 
 First run: shows QR popup for pairing.
 After pairing: runs silently in system tray.
 Tray right-click: Pair / Repair Device | Unpair Device | Quit
-
-IMPORTANT: All tkinter UI must run on the main thread.
-Tray callbacks only set flags. Main loop handles all UI.
 """
 
 import asyncio
@@ -43,6 +41,27 @@ except ImportError:
     TRAY_AVAILABLE = False
     print("[WARN] pystray not installed. Run: pip install pystray")
 
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    print("[WARN] psutil not installed. Run: pip install psutil")
+
+# GPU detection — try Nvidia first, then WMI for AMD/Intel
+GPU_METHOD = None
+try:
+    import GPUtil
+    GPU_METHOD = "gputil"
+    print("[GPU] Using GPUtil (Nvidia)")
+except ImportError:
+    try:
+        import wmi
+        GPU_METHOD = "wmi"
+        print("[GPU] Using WMI (AMD/Intel fallback)")
+    except ImportError:
+        print("[GPU] No GPU library available — GPU stats disabled")
+
 # ─────────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────────
@@ -50,6 +69,7 @@ SERVER_URL     = "ws://192.168.1.230:8000"
 DEVICE_ID_FILE = "device_id.txt"
 PAIRED_FILE    = "paired.json"
 PAIR_CODE_TTL  = 120
+STATS_INTERVAL = 3  # seconds between stat pushes
 
 # ─────────────────────────────────────────────
 # Device identity
@@ -90,26 +110,111 @@ def clear_paired():
     save_paired(False)
 
 # ─────────────────────────────────────────────
-# Flags — tray callbacks only set these.
-# Main loop reads them and does all UI work.
-#
-# we_initiated_unpair: set when WE sent unpair_from_pc to the server.
-# Prevents the echo "unpaired" message from triggering a second dialog.
+# Flags
 # ─────────────────────────────────────────────
 flags = {
-    "show_qr":              False,
-    "close_popup":          False,
-    "show_unpaired":        False,  # set by server echo — only if we didn't initiate
-    "tray_unpair":          False,
-    "tray_quit":            False,
-    "we_initiated_unpair":  False,  # suppresses echo from server after tray unpair
+    "show_qr":             False,
+    "close_popup":         False,
+    "show_unpaired":       False,
+    "tray_unpair":         False,
+    "tray_quit":           False,
+    "we_initiated_unpair": False,
 }
 
 loop_ref      = {"loop": None}
 ws_ref        = {"ws": None}
 tray_ref      = {"icon": None}
 popup_ref     = {"root": None}
-pair_code_ref = {"code": ""}  # always generated fresh before showing popup
+pair_code_ref = {"code": ""}
+
+# ─────────────────────────────────────────────
+# PC stats collection
+# ─────────────────────────────────────────────
+def get_gpu_stats():
+    """Returns (usage_percent, temp_celsius) or (None, None) if unavailable."""
+    if GPU_METHOD == "gputil":
+        try:
+            gpus = GPUtil.getGPUs()
+            if gpus:
+                g = gpus[0]
+                return round(g.load * 100, 1), round(g.temperature, 1)
+        except:
+            pass
+    elif GPU_METHOD == "wmi":
+        try:
+            w = wmi.WMI(namespace="root\\OpenHardwareMonitor")
+            sensors = w.Sensor()
+            load = None
+            temp = None
+            for s in sensors:
+                if s.SensorType == "Load" and "GPU" in s.Name:
+                    load = round(float(s.Value), 1)
+                if s.SensorType == "Temperature" and "GPU" in s.Name:
+                    temp = round(float(s.Value), 1)
+            return load, temp
+        except:
+            pass
+    return None, None
+
+def collect_stats() -> dict:
+    """Collect system stats. Returns dict ready to send."""
+    stats = {
+        "device_id": DEVICE_ID,
+        "cpu_percent": None,
+        "cpu_temp": None,
+        "ram_used_gb": None,
+        "ram_total_gb": None,
+        "ram_percent": None,
+        "disk_used_gb": None,
+        "disk_total_gb": None,
+        "disk_percent": None,
+        "gpu_percent": None,
+        "gpu_temp": None,
+    }
+
+    if not PSUTIL_AVAILABLE:
+        return stats
+
+    try:
+        stats["cpu_percent"] = psutil.cpu_percent(interval=None)
+    except:
+        pass
+
+    # CPU temperature — Windows requires specific sensors
+    try:
+        temps = psutil.sensors_temperatures()
+        if temps:
+            for name, entries in temps.items():
+                if entries:
+                    stats["cpu_temp"] = round(entries[0].current, 1)
+                    break
+    except:
+        pass
+
+    try:
+        ram = psutil.virtual_memory()
+        stats["ram_used_gb"]  = round(ram.used  / (1024 ** 3), 1)
+        stats["ram_total_gb"] = round(ram.total / (1024 ** 3), 1)
+        stats["ram_percent"]  = ram.percent
+    except:
+        pass
+
+    try:
+        disk = psutil.disk_usage("C:\\")
+        stats["disk_used_gb"]  = round(disk.used  / (1024 ** 3), 1)
+        stats["disk_total_gb"] = round(disk.total / (1024 ** 3), 1)
+        stats["disk_percent"]  = round(disk.percent, 1)
+    except:
+        pass
+
+    try:
+        gpu_pct, gpu_temp = get_gpu_stats()
+        stats["gpu_percent"] = gpu_pct
+        stats["gpu_temp"]    = gpu_temp
+    except:
+        pass
+
+    return stats
 
 # ─────────────────────────────────────────────
 # PC commands
@@ -154,7 +259,6 @@ def threadsafe_send(payload: dict):
         asyncio.run_coroutine_threadsafe(_ws_send(payload), loop)
 
 async def _register_and_code(ws):
-    """Send register + fresh pair code atomically."""
     await ws.send(json.dumps({
         "type": "register",
         "device_id": DEVICE_ID,
@@ -189,6 +293,25 @@ async def send_heartbeat(ws):
             print("[HEARTBEAT ERROR]", e)
             break
 
+async def send_stats_loop(ws):
+    """Collect and push PC stats every STATS_INTERVAL seconds."""
+    # Prime CPU percent — first call always returns 0.0
+    if PSUTIL_AVAILABLE:
+        psutil.cpu_percent(interval=None)
+    await asyncio.sleep(1)
+
+    while True:
+        try:
+            stats = collect_stats()
+            await ws.send(json.dumps({
+                "type": "pc_stats",
+                **stats
+            }))
+        except Exception as e:
+            print("[STATS ERROR]", e)
+            break
+        await asyncio.sleep(STATS_INTERVAL)
+
 async def handle_command(cmd, ws):
     t      = cmd.get("type")
     cmd_id = cmd.get("command_id")
@@ -203,17 +326,13 @@ async def handle_command(cmd, ws):
             mac = cmd.get("mac")
             if mac: wake_on_lan(mac)
         elif t == "reload_agent": os._exit(0)
-
         elif t == "pair_confirmed":
             save_paired(True)
             print("[PAIRED] Saved to paired.json")
             flags["close_popup"] = True
-
         elif t == "unpaired":
             clear_paired()
             print("[UNPAIRED] Received from server")
-            # Only show the dialog if the phone removed us.
-            # If WE initiated the unpair from the tray, suppress this echo.
             if flags["we_initiated_unpair"]:
                 print("[UNPAIRED] Suppressing echo — we initiated this unpair")
                 flags["we_initiated_unpair"] = False
@@ -252,6 +371,7 @@ async def connect():
                     print(f"[PAIR CODE REGISTERED] {pair_code_ref['code']}")
 
                 heartbeat_task = asyncio.create_task(send_heartbeat(ws))
+                stats_task     = asyncio.create_task(send_stats_loop(ws))
 
                 while True:
                     try:
@@ -261,6 +381,7 @@ async def connect():
                     except websockets.ConnectionClosed:
                         print("[DISCONNECTED] reconnecting...")
                         heartbeat_task.cancel()
+                        stats_task.cancel()
                         break
                     except Exception as e:
                         print("[RECV ERROR]", e)
@@ -278,7 +399,7 @@ def run_async():
     loop.run_until_complete(connect())
 
 # ─────────────────────────────────────────────
-# Tray — callbacks only set flags, no UI here
+# Tray
 # ─────────────────────────────────────────────
 def tray_on_pair(icon, item):
     flags["show_qr"] = True
@@ -309,13 +430,9 @@ def start_tray():
     icon.run()
 
 # ─────────────────────────────────────────────
-# Custom topmost dialog — guaranteed above all windows
+# Custom topmost dialog
 # ─────────────────────────────────────────────
-def _topmost_dialog(title: str, message: str, kind: str = "yesno"):
-    """
-    kind: "yesno" → True/False
-          "info"  → None
-    """
+def _topmost_dialog(title: str, message: str, kind: str = "yesno", extra_button: str | None = None):
     result = [None]
 
     dlg = tk.Tk()
@@ -326,8 +443,8 @@ def _topmost_dialog(title: str, message: str, kind: str = "yesno"):
     dlg.lift()
     dlg.focus_force()
 
-    w = 380
-    h = 160 if kind == "info" else 190
+    w = 400
+    h = 170 if kind == "info" else 200
     sw = dlg.winfo_screenwidth()
     sh = dlg.winfo_screenheight()
     dlg.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
@@ -336,7 +453,7 @@ def _topmost_dialog(title: str, message: str, kind: str = "yesno"):
     btn_font  = tkfont.Font(family="Segoe UI", size=10, weight="bold")
 
     tk.Label(dlg, text=message, font=body_font, bg="#1a1a2e", fg="#cccccc",
-             wraplength=340, justify="center").pack(pady=(24, 16), padx=20)
+             wraplength=360, justify="center").pack(pady=(24, 16), padx=20)
 
     btn_frame = tk.Frame(dlg, bg="#1a1a2e")
     btn_frame.pack(pady=(0, 16))
@@ -348,6 +465,16 @@ def _topmost_dialog(title: str, message: str, kind: str = "yesno"):
                   relief="flat", padx=22, pady=6, command=on_yes).pack(side="left", padx=8)
         tk.Button(btn_frame, text="No",  font=btn_font, bg="#333355", fg="white",
                   relief="flat", padx=22, pady=6, command=on_no).pack(side="left", padx=8)
+    elif kind == "triple":
+        def on_yes():   result[0] = "yes";  dlg.destroy()
+        def on_extra(): result[0] = "extra"; dlg.destroy()
+        def on_no():    result[0] = "no";   dlg.destroy()
+        tk.Button(btn_frame, text="Yes", font=btn_font, bg="#22c55e", fg="white",
+                  relief="flat", padx=16, pady=6, command=on_yes).pack(side="left", padx=6)
+        tk.Button(btn_frame, text=extra_button or "Other", font=btn_font, bg="#007aff", fg="white",
+                  relief="flat", padx=16, pady=6, command=on_extra).pack(side="left", padx=6)
+        tk.Button(btn_frame, text="No", font=btn_font, bg="#333355", fg="white",
+                  relief="flat", padx=16, pady=6, command=on_no).pack(side="left", padx=6)
     else:
         tk.Button(btn_frame, text="OK", font=btn_font, bg="#007aff", fg="white",
                   relief="flat", padx=28, pady=6, command=dlg.destroy).pack()
@@ -368,24 +495,27 @@ def close_popup_if_open():
         popup_ref["root"] = None
 
 def _fresh_code() -> str:
-    """Generate a new pair code, store it, and return it."""
     code = str(random.randint(100000, 999999))
     pair_code_ref["code"] = code
     return code
 
-def show_pair_popup():
-    """
-    Always generates a brand-new code before showing the popup.
-    Registers it with the server, then opens the window.
-    Main thread only.
-    """
-    close_popup_if_open()
+def _do_unpair_and_notify():
+    flags["we_initiated_unpair"] = True
+    clear_paired()
+    threadsafe_send({"type": "unpair_from_pc", "device_id": DEVICE_ID})
+    threadsafe_send({
+        "type": "register",
+        "device_id": DEVICE_ID,
+        "device_name": DEVICE_NAME,
+        "is_paired": False
+    })
+    print("[AGENT] Unpaired and notified server")
 
-    # Always fresh code — never reuse the last one
+def show_pair_popup():
+    close_popup_if_open()
     code = _fresh_code()
     print(f"[NEW PAIR CODE] {code}")
     threadsafe_register_and_code()
-    # Give server a moment to store the code before the popup appears
     time.sleep(0.4)
 
     root = tk.Tk()
@@ -409,11 +539,8 @@ def show_pair_popup():
     small_font = tkfont.Font(family="Segoe UI", size=8)
 
     tk.Label(root, text="PC Control Hub", font=title_font, bg="#1a1a2e", fg="#ffffff").pack(pady=(18, 2))
-    tk.Label(
-        root,
-        text="Scan the QR code or enter the manual\ncode in the app to pair your phone.",
-        font=body_font, bg="#1a1a2e", fg="#aaaaaa", justify="center"
-    ).pack(pady=(0, 10))
+    tk.Label(root, text="Scan the QR code or enter the manual\ncode in the app to pair your phone.",
+             font=body_font, bg="#1a1a2e", fg="#aaaaaa", justify="center").pack(pady=(0, 10))
 
     if QR_AVAILABLE:
         qr_data = json.dumps({"server": SERVER_URL, "code": code})
@@ -444,7 +571,6 @@ def show_pair_popup():
     remaining = [PAIR_CODE_TTL]
 
     def tick():
-        # Close silently if pairing succeeded while popup was open
         if is_paired():
             root.destroy()
             return
@@ -454,7 +580,6 @@ def show_pair_popup():
             root.after(1000, tick)
         else:
             if not is_paired():
-                # Auto-regenerate — set flag so main loop reopens with fresh code
                 print("[AUTO REGENERATE] Timer expired")
                 root.destroy()
                 flags["show_qr"] = True
@@ -466,34 +591,28 @@ def show_pair_popup():
     popup_ref["root"] = None
 
 def handle_show_qr():
-    """
-    Triggered by flags["show_qr"].
-    If already paired: show info dialog to unpair first.
-    If not paired: show QR popup with a fresh code.
-    """
     if is_paired():
-        _topmost_dialog(
+        answer = _topmost_dialog(
             "PC Control Hub — Already Paired",
             f"{DEVICE_NAME} is already paired to a phone.\n\n"
-            "To pair with a different phone, select\n"
-            "\"Unpair Device\" from the tray icon first.",
-            kind="info"
+            "Would you like to unpair and pair with a new phone instead?",
+            kind="triple",
+            extra_button="Unpair & Repair"
         )
+        if answer == "extra":
+            _do_unpair_and_notify()
+            time.sleep(0.3)
+            show_pair_popup()
         return
     show_pair_popup()
 
 def handle_unpaired_dialog():
-    """
-    Phone removed us. Offer re-pair or uninstall.
-    Called only when the phone initiated the unpair (not us).
-    """
     repair = _topmost_dialog(
         "PC Control Hub — Device Unpaired",
         "Your phone has been disconnected from this PC.\n\n"
         "Would you like to pair with a new phone?",
         kind="yesno"
     )
-
     if repair:
         show_pair_popup()
     else:
@@ -515,44 +634,21 @@ def handle_unpaired_dialog():
             print("[AGENT] Running unpaired in background.")
 
 def handle_tray_unpair():
-    """Tray 'Unpair Device' clicked."""
     if not is_paired():
-        _topmost_dialog(
-            "PC Control Hub",
-            "This PC is not currently paired to any phone.",
-            kind="info"
-        )
+        _topmost_dialog("PC Control Hub", "This PC is not currently paired to any phone.", kind="info")
         return
 
     result = _topmost_dialog(
         "Unpair Device",
-        f"This will disconnect your phone from {DEVICE_NAME}.\n\n"
-        "Are you sure you want to unpair?",
+        f"This will disconnect your phone from {DEVICE_NAME}.\n\nAre you sure you want to unpair?",
         kind="yesno"
     )
-
     if not result:
         return
 
-    # Set flag BEFORE sending so handle_command can suppress the echo
-    flags["we_initiated_unpair"] = True
-    clear_paired()
-    threadsafe_send({"type": "unpair_from_pc", "device_id": DEVICE_ID})
-    # Re-register so server updates paired_devices immediately
-    threadsafe_send({
-        "type": "register",
-        "device_id": DEVICE_ID,
-        "device_name": DEVICE_NAME,
-        "is_paired": False
-    })
-    print("[TRAY] Unpaired from PC side")
+    _do_unpair_and_notify()
 
-    again = _topmost_dialog(
-        "Pair New Device?",
-        "Would you like to pair this PC with a new phone?",
-        kind="yesno"
-    )
-
+    again = _topmost_dialog("Pair New Device?", "Would you like to pair this PC with a new phone?", kind="yesno")
     if again:
         show_pair_popup()
 
@@ -563,6 +659,8 @@ if __name__ == "__main__":
     print(f"[AGENT] Device:    {DEVICE_NAME} ({DEVICE_ID})")
     print(f"[AGENT] Server:    {SERVER_URL}")
     print(f"[AGENT] Paired:    {is_paired()}")
+    print(f"[AGENT] psutil:    {PSUTIL_AVAILABLE}")
+    print(f"[AGENT] GPU:       {GPU_METHOD or 'unavailable'}")
 
     def handle_sigint(sig, frame):
         print("\n[EXIT] Agent stopped.")
@@ -578,7 +676,6 @@ if __name__ == "__main__":
 
     time.sleep(0.8)
 
-    # First run — generate code and show popup if not paired
     if not is_paired():
         _fresh_code()
         show_pair_popup()

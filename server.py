@@ -65,6 +65,15 @@ async def broadcast(payload):
             except:
                 group.discard(ws)
 
+async def broadcast_to_mobile(payload):
+    """Send only to mobile clients — used for stats to avoid feedback loops."""
+    msg = json.dumps(payload)
+    for ws in list(mobile_clients):
+        try:
+            await ws.send(msg)
+        except:
+            mobile_clients.discard(ws)
+
 async def update_state(device_id):
     now  = time.time()
     last = device_last_seen.get(device_id, 0)
@@ -114,10 +123,6 @@ async def send_to_device(device_id, payload):
         print("[SEND ERROR]", e)
         return False
 
-# ─────────────────────────────────────────────
-# Unpair — includes device_name in broadcast so
-# the phone can show the actual PC name in alerts
-# ─────────────────────────────────────────────
 async def do_unpair(device_id: str, notify_mobile: bool = True):
     name = device_names.get(device_id, "Unknown-PC")
     paired_devices.pop(device_id, None)
@@ -136,7 +141,7 @@ async def do_unpair(device_id: str, notify_mobile: bool = True):
         await broadcast({
             "type": "device_removed",
             "device_id": device_id,
-            "device_name": name   # ← phone uses this for the alert message
+            "device_name": name
         })
 
 # ─────────────────────────────────────────────
@@ -148,7 +153,7 @@ async def handler(ws):
 
     try:
         async for msg in ws:
-            print("[RAW MESSAGE]", msg)
+            print("[RAW MESSAGE]", msg[:120])  # truncate long stat messages in logs
             data     = json.loads(msg)
             msg_type = data.get("type")
 
@@ -191,6 +196,12 @@ async def handler(ws):
                     device_last_seen[dev] = time.time()
                     await send_log("HEARTBEAT", {"device_id": dev})
                     await update_state(dev)
+
+            # ── PC STATS — forward straight to mobile clients ──
+            elif msg_type == "pc_stats":
+                dev_id = data.get("device_id")
+                if dev_id:
+                    await broadcast_to_mobile(data)
 
             # ── MOBILE REGISTRATION ──
             elif msg_type == "register_mobile":
@@ -258,9 +269,7 @@ async def handler(ws):
                         }
                         print(f"[PAIRED] {matched_id}")
                         await send_log("PAIRED", {"device_id": matched_id})
-
                         await send_to_device(matched_id, {"type": "pair_confirmed"})
-
                         await ws.send(json.dumps({
                             "type": "pair_success",
                             "device_id": matched_id,
