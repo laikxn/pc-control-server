@@ -115,9 +115,11 @@ async def send_to_device(device_id, payload):
         return False
 
 # ─────────────────────────────────────────────
-# Unpair
+# Unpair — includes device_name in broadcast so
+# the phone can show the actual PC name in alerts
 # ─────────────────────────────────────────────
 async def do_unpair(device_id: str, notify_mobile: bool = True):
+    name = device_names.get(device_id, "Unknown-PC")
     paired_devices.pop(device_id, None)
     pair_codes.pop(device_id, None)
 
@@ -131,7 +133,11 @@ async def do_unpair(device_id: str, notify_mobile: bool = True):
     await send_log("UNPAIRED", {"device_id": device_id})
 
     if notify_mobile:
-        await broadcast({"type": "device_removed", "device_id": device_id})
+        await broadcast({
+            "type": "device_removed",
+            "device_id": device_id,
+            "device_name": name   # ← phone uses this for the alert message
+        })
 
 # ─────────────────────────────────────────────
 # Main handler
