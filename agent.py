@@ -92,20 +92,24 @@ def clear_paired():
 # ─────────────────────────────────────────────
 # Flags — tray callbacks only set these.
 # Main loop reads them and does all UI work.
+#
+# we_initiated_unpair: set when WE sent unpair_from_pc to the server.
+# Prevents the echo "unpaired" message from triggering a second dialog.
 # ─────────────────────────────────────────────
 flags = {
-    "show_qr":       False,
-    "close_popup":   False,
-    "show_unpaired": False,
-    "tray_unpair":   False,
-    "tray_quit":     False,
+    "show_qr":              False,
+    "close_popup":          False,
+    "show_unpaired":        False,  # set by server echo — only if we didn't initiate
+    "tray_unpair":          False,
+    "tray_quit":            False,
+    "we_initiated_unpair":  False,  # suppresses echo from server after tray unpair
 }
 
 loop_ref      = {"loop": None}
 ws_ref        = {"ws": None}
 tray_ref      = {"icon": None}
 popup_ref     = {"root": None}
-pair_code_ref = {"code": str(random.randint(100000, 999999))}
+pair_code_ref = {"code": ""}  # always generated fresh before showing popup
 
 # ─────────────────────────────────────────────
 # PC commands
@@ -150,7 +154,7 @@ def threadsafe_send(payload: dict):
         asyncio.run_coroutine_threadsafe(_ws_send(payload), loop)
 
 async def _register_and_code(ws):
-    """Send register + pair code atomically in the async loop."""
+    """Send register + fresh pair code atomically."""
     await ws.send(json.dumps({
         "type": "register",
         "device_id": DEVICE_ID,
@@ -166,7 +170,6 @@ async def _register_and_code(ws):
         print(f"[PAIR CODE REGISTERED] {pair_code_ref['code']}")
 
 def threadsafe_register_and_code():
-    """Re-register + re-send pair code from any thread."""
     ws   = ws_ref.get("ws")
     loop = loop_ref.get("loop")
     if ws and loop and not loop.is_closed():
@@ -200,14 +203,22 @@ async def handle_command(cmd, ws):
             mac = cmd.get("mac")
             if mac: wake_on_lan(mac)
         elif t == "reload_agent": os._exit(0)
+
         elif t == "pair_confirmed":
             save_paired(True)
             print("[PAIRED] Saved to paired.json")
             flags["close_popup"] = True
+
         elif t == "unpaired":
             clear_paired()
             print("[UNPAIRED] Received from server")
-            flags["show_unpaired"] = True
+            # Only show the dialog if the phone removed us.
+            # If WE initiated the unpair from the tray, suppress this echo.
+            if flags["we_initiated_unpair"]:
+                print("[UNPAIRED] Suppressing echo — we initiated this unpair")
+                flags["we_initiated_unpair"] = False
+            else:
+                flags["show_unpaired"] = True
 
         if cmd_id:
             await ws.send(json.dumps({
@@ -232,7 +243,7 @@ async def connect():
                     "is_paired": is_paired()
                 }))
 
-                if not is_paired():
+                if not is_paired() and pair_code_ref["code"]:
                     await ws.send(json.dumps({
                         "type": "set_pair_code",
                         "device_id": DEVICE_ID,
@@ -298,14 +309,12 @@ def start_tray():
     icon.run()
 
 # ─────────────────────────────────────────────
-# Custom topmost dialog helper
-# Replaces messagebox so we can force -topmost
+# Custom topmost dialog — guaranteed above all windows
 # ─────────────────────────────────────────────
-def _topmost_dialog(title: str, message: str, kind: str = "yesno") -> bool | None:
+def _topmost_dialog(title: str, message: str, kind: str = "yesno"):
     """
-    Show a dialog that is guaranteed to appear above all other windows.
-    kind: "yesno" → returns True/False
-          "info"  → returns None
+    kind: "yesno" → True/False
+          "info"  → None
     """
     result = [None]
 
@@ -317,27 +326,24 @@ def _topmost_dialog(title: str, message: str, kind: str = "yesno") -> bool | Non
     dlg.lift()
     dlg.focus_force()
 
-    w, h = 360, 160 if kind == "info" else 180
+    w = 380
+    h = 160 if kind == "info" else 190
     sw = dlg.winfo_screenwidth()
     sh = dlg.winfo_screenheight()
     dlg.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
 
-    body_font  = tkfont.Font(family="Segoe UI", size=10)
-    btn_font   = tkfont.Font(family="Segoe UI", size=10, weight="bold")
+    body_font = tkfont.Font(family="Segoe UI", size=10)
+    btn_font  = tkfont.Font(family="Segoe UI", size=10, weight="bold")
 
     tk.Label(dlg, text=message, font=body_font, bg="#1a1a2e", fg="#cccccc",
-             wraplength=320, justify="center").pack(pady=(24, 16), padx=20)
+             wraplength=340, justify="center").pack(pady=(24, 16), padx=20)
 
     btn_frame = tk.Frame(dlg, bg="#1a1a2e")
     btn_frame.pack(pady=(0, 16))
 
     if kind == "yesno":
-        def on_yes():
-            result[0] = True
-            dlg.destroy()
-        def on_no():
-            result[0] = False
-            dlg.destroy()
+        def on_yes(): result[0] = True;  dlg.destroy()
+        def on_no():  result[0] = False; dlg.destroy()
         tk.Button(btn_frame, text="Yes", font=btn_font, bg="#22c55e", fg="white",
                   relief="flat", padx=22, pady=6, command=on_yes).pack(side="left", padx=8)
         tk.Button(btn_frame, text="No",  font=btn_font, bg="#333355", fg="white",
@@ -361,11 +367,26 @@ def close_popup_if_open():
             pass
         popup_ref["root"] = None
 
+def _fresh_code() -> str:
+    """Generate a new pair code, store it, and return it."""
+    code = str(random.randint(100000, 999999))
+    pair_code_ref["code"] = code
+    return code
+
 def show_pair_popup():
-    """Show QR pairing popup. Main thread only."""
+    """
+    Always generates a brand-new code before showing the popup.
+    Registers it with the server, then opens the window.
+    Main thread only.
+    """
     close_popup_if_open()
 
-    code = pair_code_ref["code"]
+    # Always fresh code — never reuse the last one
+    code = _fresh_code()
+    print(f"[NEW PAIR CODE] {code}")
+    threadsafe_register_and_code()
+    # Give server a moment to store the code before the popup appears
+    time.sleep(0.4)
 
     root = tk.Tk()
     popup_ref["root"] = root
@@ -423,6 +444,7 @@ def show_pair_popup():
     remaining = [PAIR_CODE_TTL]
 
     def tick():
+        # Close silently if pairing succeeded while popup was open
         if is_paired():
             root.destroy()
             return
@@ -432,10 +454,8 @@ def show_pair_popup():
             root.after(1000, tick)
         else:
             if not is_paired():
-                new_code = str(random.randint(100000, 999999))
-                pair_code_ref["code"] = new_code
-                print(f"[AUTO REGENERATE] {new_code}")
-                threadsafe_register_and_code()
+                # Auto-regenerate — set flag so main loop reopens with fresh code
+                print("[AUTO REGENERATE] Timer expired")
                 root.destroy()
                 flags["show_qr"] = True
             else:
@@ -447,24 +467,26 @@ def show_pair_popup():
 
 def handle_show_qr():
     """
-    Called from main loop when flags["show_qr"] is set.
-    If already paired: show info dialog telling user to unpair first.
-    If not paired: show QR popup.
+    Triggered by flags["show_qr"].
+    If already paired: show info dialog to unpair first.
+    If not paired: show QR popup with a fresh code.
     """
     if is_paired():
         _topmost_dialog(
             "PC Control Hub — Already Paired",
             f"{DEVICE_NAME} is already paired to a phone.\n\n"
-            "To pair with a different phone, please select\n"
+            "To pair with a different phone, select\n"
             "\"Unpair Device\" from the tray icon first.",
             kind="info"
         )
         return
-
     show_pair_popup()
 
 def handle_unpaired_dialog():
-    """Server told us the phone removed us. Offer re-pair or uninstall."""
+    """
+    Phone removed us. Offer re-pair or uninstall.
+    Called only when the phone initiated the unpair (not us).
+    """
     repair = _topmost_dialog(
         "PC Control Hub — Device Unpaired",
         "Your phone has been disconnected from this PC.\n\n"
@@ -473,12 +495,6 @@ def handle_unpaired_dialog():
     )
 
     if repair:
-        new_code = str(random.randint(100000, 999999))
-        pair_code_ref["code"] = new_code
-        # Re-register so server has fresh state + new code
-        threadsafe_register_and_code()
-        # Small delay so server processes the new code before popup appears
-        time.sleep(0.5)
         show_pair_popup()
     else:
         uninstall = _topmost_dialog(
@@ -518,10 +534,11 @@ def handle_tray_unpair():
     if not result:
         return
 
+    # Set flag BEFORE sending so handle_command can suppress the echo
+    flags["we_initiated_unpair"] = True
     clear_paired()
-
-    # Notify server: unpair_from_pc + register with is_paired=False
     threadsafe_send({"type": "unpair_from_pc", "device_id": DEVICE_ID})
+    # Re-register so server updates paired_devices immediately
     threadsafe_send({
         "type": "register",
         "device_id": DEVICE_ID,
@@ -537,12 +554,6 @@ def handle_tray_unpair():
     )
 
     if again:
-        new_code = str(random.randint(100000, 999999))
-        pair_code_ref["code"] = new_code
-        # Send fresh code to server before showing popup
-        threadsafe_register_and_code()
-        # Wait briefly so the server has processed the new code
-        time.sleep(0.5)
         show_pair_popup()
 
 # ─────────────────────────────────────────────
@@ -567,7 +578,9 @@ if __name__ == "__main__":
 
     time.sleep(0.8)
 
+    # First run — generate code and show popup if not paired
     if not is_paired():
+        _fresh_code()
         show_pair_popup()
 
     print("[AGENT] Running. Right-click the tray icon for options.")
