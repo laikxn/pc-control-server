@@ -1,0 +1,17 @@
+# PC Control Hub — files that are local to each machine only
+paired.json
+device_id.txt
+
+# PyInstaller build artifacts
+dist/
+build/
+*.spec
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# OS files
+.DS_Store
+Thumbs.db
