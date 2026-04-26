@@ -48,7 +48,6 @@ except ImportError:
     PSUTIL_AVAILABLE = False
     print("[WARN] psutil not installed. Run: pip install psutil")
 
-# GPU detection — try Nvidia first, then WMI for AMD/Intel
 GPU_METHOD = None
 try:
     import GPUtil
@@ -65,11 +64,28 @@ except ImportError:
 # ─────────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────────
-SERVER_URL     = "ws://192.168.1.230:8000"
-DEVICE_ID_FILE = "device_id.txt"
-PAIRED_FILE    = "paired.json"
-PAIR_CODE_TTL  = 120
-STATS_INTERVAL = 3  # seconds between stat pushes
+SERVER_URL         = "ws://192.168.1.230:8000"
+DEVICE_ID_FILE     = "device_id.txt"
+PAIRED_FILE        = "paired.json"
+PAIR_CODE_TTL      = 120
+STATS_INTERVAL     = 3
+AUTOSTART_REG_NAME = "PCControlHubAgent"
+
+# ─────────────────────────────────────────────
+# Auto-start registry
+# ─────────────────────────────────────────────
+def setup_autostart():
+    if os.name != "nt":
+        return
+    try:
+        import winreg
+        exe_path = sys.executable
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, AUTOSTART_REG_NAME, 0, winreg.REG_SZ, f'"{exe_path}"')
+        print(f"[AUTOSTART] Registered: {exe_path}")
+    except Exception as e:
+        print(f"[AUTOSTART] Failed: {e}")
 
 # ─────────────────────────────────────────────
 # Device identity
@@ -87,18 +103,10 @@ def get_device_name():
     return os.environ.get("COMPUTERNAME", socket.gethostname())
 
 def get_device_mac() -> str:
-    """
-    Read this machine's primary MAC address using uuid.getnode().
-    Returns a colon-separated uppercase string like AA:BB:CC:DD:EE:FF.
-    Falls back to '00:00:00:00:00:00' on any error.
-    """
     try:
-        raw = uuid.getnode()
-        # uuid.getnode() can return a random value if it can't find a real MAC;
-        # the multicast bit (LSB of first octet) is set in that case.
+        raw       = uuid.getnode()
         mac_bytes = raw.to_bytes(6, "big")
-        mac_str   = ":".join(f"{b:02X}" for b in mac_bytes)
-        return mac_str
+        return ":".join(f"{b:02X}" for b in mac_bytes)
     except Exception as e:
         print("[MAC ERROR]", e)
         return "00:00:00:00:00:00"
@@ -146,10 +154,9 @@ popup_ref     = {"root": None}
 pair_code_ref = {"code": ""}
 
 # ─────────────────────────────────────────────
-# PC stats collection
+# PC stats
 # ─────────────────────────────────────────────
 def get_gpu_stats():
-    """Returns (usage_percent, temp_celsius) or (None, None) if unavailable."""
     if GPU_METHOD == "gputil":
         try:
             gpus = GPUtil.getGPUs()
@@ -160,58 +167,32 @@ def get_gpu_stats():
             pass
     elif GPU_METHOD == "wmi":
         try:
-            w = wmi.WMI(namespace="root\\OpenHardwareMonitor")
+            w       = wmi.WMI(namespace="root\\OpenHardwareMonitor")
             sensors = w.Sensor()
-            load = None
-            temp = None
+            load = temp = None
             for s in sensors:
-                if s.SensorType == "Load" and "GPU" in s.Name:
-                    load = round(float(s.Value), 1)
-                if s.SensorType == "Temperature" and "GPU" in s.Name:
-                    temp = round(float(s.Value), 1)
+                if s.SensorType == "Load"        and "GPU" in s.Name: load = round(float(s.Value), 1)
+                if s.SensorType == "Temperature" and "GPU" in s.Name: temp = round(float(s.Value), 1)
             return load, temp
         except:
             pass
     return None, None
 
 def get_disk_stats() -> list:
-    """
-    Returns a list of dicts for each real local drive:
-      [{ label, used_gb, total_gb, percent }, ...]
-
-    Filters out optical drives, network mounts, and any partition
-    that raises an error (e.g. empty CD tray).
-    """
     if not PSUTIL_AVAILABLE:
         return []
-
-    EXCLUDED_FSTYPES = {"cdrom", "udf", "iso9660", "squashfs", "tmpfs",
-                        "devtmpfs", "devfs", "overlay", "proc", "sysfs"}
-    EXCLUDED_OPTS    = {"cdrom", "remote"}
-
+    EXCLUDED_FSTYPES = {"cdrom","udf","iso9660","squashfs","tmpfs","devtmpfs","devfs","overlay","proc","sysfs"}
+    EXCLUDED_OPTS    = {"cdrom","remote"}
     disks = []
     try:
-        partitions = psutil.disk_partitions(all=False)
-        for part in partitions:
-            # Skip optical / network / virtual filesystems
-            if part.fstype.lower() in EXCLUDED_FSTYPES:
-                continue
-            if any(opt in part.opts.lower() for opt in EXCLUDED_OPTS):
-                continue
-            # Windows: only include drive letters (e.g. C:\, D:\)
-            # Linux/Mac: include normal mount points
+        for part in psutil.disk_partitions(all=False):
+            if part.fstype.lower() in EXCLUDED_FSTYPES: continue
+            if any(opt in part.opts.lower() for opt in EXCLUDED_OPTS): continue
             try:
                 usage = psutil.disk_usage(part.mountpoint)
             except (PermissionError, OSError):
                 continue
-
-            # Build a friendly label: prefer drive letter on Windows,
-            # mountpoint on Linux/Mac
-            if os.name == "nt":
-                label = part.device.rstrip("\\").rstrip("/")  # e.g. "C:"
-            else:
-                label = part.mountpoint  # e.g. "/"
-
+            label = part.device.rstrip("\\").rstrip("/") if os.name == "nt" else part.mountpoint
             disks.append({
                 "label":    label,
                 "used_gb":  round(usage.used  / (1024 ** 3), 1),
@@ -220,87 +201,69 @@ def get_disk_stats() -> list:
             })
     except Exception as e:
         print("[DISK ERROR]", e)
-
     return disks
 
 def collect_stats() -> dict:
-    """Collect system stats. Returns dict ready to send."""
     stats = {
-        "device_id":   DEVICE_ID,
-        "cpu_percent": None,
-        "cpu_temp":    None,
-        "ram_used_gb": None,
-        "ram_total_gb":None,
-        "ram_percent": None,
-        "disks":       [],        # replaces single disk_* fields
-        "gpu_percent": None,
-        "gpu_temp":    None,
+        "device_id": DEVICE_ID, "cpu_percent": None, "cpu_temp": None,
+        "ram_used_gb": None, "ram_total_gb": None, "ram_percent": None,
+        "disks": [], "gpu_percent": None, "gpu_temp": None,
     }
-
     if not PSUTIL_AVAILABLE:
         return stats
-
-    try:
-        stats["cpu_percent"] = psutil.cpu_percent(interval=None)
-    except:
-        pass
-
-    # CPU temperature — Windows requires specific sensors
+    try:    stats["cpu_percent"] = psutil.cpu_percent(interval=None)
+    except: pass
     try:
         temps = psutil.sensors_temperatures()
         if temps:
-            for name, entries in temps.items():
-                if entries:
-                    stats["cpu_temp"] = round(entries[0].current, 1)
-                    break
-    except:
-        pass
-
+            for _, entries in temps.items():
+                if entries: stats["cpu_temp"] = round(entries[0].current, 1); break
+    except: pass
     try:
         ram = psutil.virtual_memory()
         stats["ram_used_gb"]  = round(ram.used  / (1024 ** 3), 1)
         stats["ram_total_gb"] = round(ram.total / (1024 ** 3), 1)
         stats["ram_percent"]  = ram.percent
-    except:
-        pass
-
-    # Multi-disk
+    except: pass
     stats["disks"] = get_disk_stats()
-
     try:
-        gpu_pct, gpu_temp = get_gpu_stats()
+        gpu_pct, gpu_temp    = get_gpu_stats()
         stats["gpu_percent"] = gpu_pct
         stats["gpu_temp"]    = gpu_temp
-    except:
-        pass
-
+    except: pass
     return stats
 
 # ─────────────────────────────────────────────
 # PC commands
+# /f flag forces processes to close even on a locked session (no admin needed)
 # ─────────────────────────────────────────────
-def shutdown_pc():
+def shutdown_pc() -> bool:
     print("[ACTION] Shutdown")
-    os.system("shutdown /s /t 0")
+    result = os.system("shutdown /s /t 0 /f")
+    return result == 0
 
-def restart_pc():
+def restart_pc() -> bool:
     print("[ACTION] Restart")
-    os.system("shutdown /r /t 0")
+    result = os.system("shutdown /r /t 0 /f")
+    return result == 0
 
-def lock_pc():
+def lock_pc() -> bool:
     print("[ACTION] Lock")
-    os.system("rundll32.exe user32.dll,LockWorkStation")
+    result = os.system("rundll32.exe user32.dll,LockWorkStation")
+    return result == 0
 
-def wake_on_lan(mac: str):
+def wake_on_lan(mac: str) -> bool:
     try:
         mac_bytes = bytes.fromhex(mac.replace(":", "").replace("-", ""))
-        packet = b"\xff" * 6 + mac_bytes * 16
+        packet    = b"\xff" * 6 + mac_bytes * 16
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
             s.sendto(packet, ("255.255.255.255", 9))
         print("[WOL] Sent")
+        return True
     except Exception as e:
         print("[WOL ERROR]", e)
+        return False
 
 # ─────────────────────────────────────────────
 # WebSocket helpers
@@ -308,10 +271,8 @@ def wake_on_lan(mac: str):
 async def _ws_send(payload: dict):
     ws = ws_ref.get("ws")
     if ws:
-        try:
-            await ws.send(json.dumps(payload))
-        except Exception as e:
-            print("[WS SEND ERROR]", e)
+        try:    await ws.send(json.dumps(payload))
+        except Exception as e: print("[WS SEND ERROR]", e)
 
 def threadsafe_send(payload: dict):
     loop = loop_ref.get("loop")
@@ -320,73 +281,66 @@ def threadsafe_send(payload: dict):
 
 async def _register_and_code(ws):
     await ws.send(json.dumps({
-        "type":        "register",
-        "device_id":   DEVICE_ID,
-        "device_name": DEVICE_NAME,
-        "device_mac":  DEVICE_MAC,
-        "is_paired":   is_paired()
+        "type": "register", "device_id": DEVICE_ID,
+        "device_name": DEVICE_NAME, "device_mac": DEVICE_MAC, "is_paired": is_paired()
     }))
     if not is_paired():
         await ws.send(json.dumps({
-            "type":      "set_pair_code",
-            "device_id": DEVICE_ID,
-            "code":      pair_code_ref["code"]
+            "type": "set_pair_code", "device_id": DEVICE_ID, "code": pair_code_ref["code"]
         }))
         print(f"[PAIR CODE REGISTERED] {pair_code_ref['code']}")
 
 def threadsafe_register_and_code():
-    ws   = ws_ref.get("ws")
-    loop = loop_ref.get("loop")
+    ws = ws_ref.get("ws"); loop = loop_ref.get("loop")
     if ws and loop and not loop.is_closed():
         asyncio.run_coroutine_threadsafe(_register_and_code(ws), loop)
 
 async def send_heartbeat(ws):
     while True:
         try:
-            await ws.send(json.dumps({
-                "type":      "heartbeat",
-                "device_id": DEVICE_ID,
-                "timestamp": time.time()
-            }))
+            await ws.send(json.dumps({"type": "heartbeat", "device_id": DEVICE_ID, "timestamp": time.time()}))
             print("[HEARTBEAT] sent")
             await asyncio.sleep(10)
         except Exception as e:
-            print("[HEARTBEAT ERROR]", e)
-            break
+            print("[HEARTBEAT ERROR]", e); break
 
 async def send_stats_loop(ws):
-    """Collect and push PC stats every STATS_INTERVAL seconds."""
-    # Prime CPU percent — first call always returns 0.0
-    if PSUTIL_AVAILABLE:
-        psutil.cpu_percent(interval=None)
+    if PSUTIL_AVAILABLE: psutil.cpu_percent(interval=None)
     await asyncio.sleep(1)
-
     while True:
         try:
             stats = collect_stats()
-            await ws.send(json.dumps({
-                "type": "pc_stats",
-                **stats
-            }))
+            await ws.send(json.dumps({"type": "pc_stats", **stats}))
         except Exception as e:
-            print("[STATS ERROR]", e)
-            break
+            print("[STATS ERROR]", e); break
         await asyncio.sleep(STATS_INTERVAL)
 
 async def handle_command(cmd, ws):
     t      = cmd.get("type")
     cmd_id = cmd.get("command_id")
-    if not t:
-        return
+    if not t: return
     print(f"[COMMAND] {t}")
+
+    status = "executed"
     try:
-        if t == "shutdown_pc":   shutdown_pc()
-        elif t == "restart_pc":  restart_pc()
-        elif t == "lock_pc":     lock_pc()
+        if t == "shutdown_pc":
+            ok = shutdown_pc()
+            if not ok: status = "failed"
+        elif t == "restart_pc":
+            ok = restart_pc()
+            if not ok: status = "failed"
+        elif t == "lock_pc":
+            ok = lock_pc()
+            if not ok: status = "failed"
         elif t == "wake_pc":
             mac = cmd.get("mac")
-            if mac: wake_on_lan(mac)
-        elif t == "reload_agent": os._exit(0)
+            if mac:
+                ok = wake_on_lan(mac)
+                if not ok: status = "failed"
+            else:
+                status = "failed"
+        elif t == "reload_agent":
+            os._exit(0)
         elif t == "pair_confirmed":
             save_paired(True)
             print("[PAIRED] Saved to paired.json")
@@ -399,15 +353,12 @@ async def handle_command(cmd, ws):
                 flags["we_initiated_unpair"] = False
             else:
                 flags["show_unpaired"] = True
-
-        if cmd_id:
-            await ws.send(json.dumps({
-                "type":       "ack",
-                "command_id": cmd_id,
-                "status":     "executed"
-            }))
     except Exception as e:
         print("[COMMAND ERROR]", e)
+        status = "failed"
+
+    if cmd_id:
+        await ws.send(json.dumps({"type": "ack", "command_id": cmd_id, "status": status}))
 
 async def connect():
     while True:
@@ -415,20 +366,13 @@ async def connect():
             async with websockets.connect(SERVER_URL) as ws:
                 ws_ref["ws"] = ws
                 print("[CONNECTED]")
-
                 await ws.send(json.dumps({
-                    "type":        "register",
-                    "device_id":   DEVICE_ID,
-                    "device_name": DEVICE_NAME,
-                    "device_mac":  DEVICE_MAC,
-                    "is_paired":   is_paired()
+                    "type": "register", "device_id": DEVICE_ID,
+                    "device_name": DEVICE_NAME, "device_mac": DEVICE_MAC, "is_paired": is_paired()
                 }))
-
                 if not is_paired() and pair_code_ref["code"]:
                     await ws.send(json.dumps({
-                        "type":      "set_pair_code",
-                        "device_id": DEVICE_ID,
-                        "code":      pair_code_ref["code"]
+                        "type": "set_pair_code", "device_id": DEVICE_ID, "code": pair_code_ref["code"]
                     }))
                     print(f"[PAIR CODE REGISTERED] {pair_code_ref['code']}")
 
@@ -442,15 +386,11 @@ async def connect():
                         await handle_command(data, ws)
                     except websockets.ConnectionClosed:
                         print("[DISCONNECTED] reconnecting...")
-                        heartbeat_task.cancel()
-                        stats_task.cancel()
-                        break
+                        heartbeat_task.cancel(); stats_task.cancel(); break
                     except Exception as e:
                         print("[RECV ERROR]", e)
-
         except Exception as e:
             print("[CONNECTION ERROR]", e)
-
         ws_ref["ws"] = None
         await asyncio.sleep(3)
 
@@ -463,14 +403,9 @@ def run_async():
 # ─────────────────────────────────────────────
 # Tray
 # ─────────────────────────────────────────────
-def tray_on_pair(icon, item):
-    flags["show_qr"] = True
-
-def tray_on_unpair(icon, item):
-    flags["tray_unpair"] = True
-
-def tray_on_quit(icon, item):
-    flags["tray_quit"] = True
+def tray_on_pair(icon, item):   flags["show_qr"]     = True
+def tray_on_unpair(icon, item): flags["tray_unpair"] = True
+def tray_on_quit(icon, item):   flags["tray_quit"]   = True
 
 def make_tray_image():
     img  = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
@@ -479,8 +414,7 @@ def make_tray_image():
     return img
 
 def start_tray():
-    if not TRAY_AVAILABLE:
-        return
+    if not TRAY_AVAILABLE: return
     menu = pystray.Menu(
         pystray.MenuItem("Pair / Repair Device", tray_on_pair),
         pystray.MenuItem("Unpair Device",         tray_on_unpair),
@@ -496,51 +430,31 @@ def start_tray():
 # ─────────────────────────────────────────────
 def _topmost_dialog(title: str, message: str, kind: str = "yesno", extra_button: str | None = None):
     result = [None]
-
     dlg = tk.Tk()
-    dlg.title(title)
-    dlg.configure(bg="#1a1a2e")
-    dlg.resizable(False, False)
-    dlg.attributes("-topmost", True)
-    dlg.lift()
-    dlg.focus_force()
-
-    w = 400
-    h = 170 if kind == "info" else 200
-    sw = dlg.winfo_screenwidth()
-    sh = dlg.winfo_screenheight()
-    dlg.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
-
+    dlg.title(title); dlg.configure(bg="#1a1a2e"); dlg.resizable(False, False)
+    dlg.attributes("-topmost", True); dlg.lift(); dlg.focus_force()
+    w = 400; h = 170 if kind == "info" else 200
+    sw = dlg.winfo_screenwidth(); sh = dlg.winfo_screenheight()
+    dlg.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
     body_font = tkfont.Font(family="Segoe UI", size=10)
     btn_font  = tkfont.Font(family="Segoe UI", size=10, weight="bold")
-
     tk.Label(dlg, text=message, font=body_font, bg="#1a1a2e", fg="#cccccc",
-             wraplength=360, justify="center").pack(pady=(24, 16), padx=20)
-
-    btn_frame = tk.Frame(dlg, bg="#1a1a2e")
-    btn_frame.pack(pady=(0, 16))
-
+             wraplength=360, justify="center").pack(pady=(24,16), padx=20)
+    btn_frame = tk.Frame(dlg, bg="#1a1a2e"); btn_frame.pack(pady=(0,16))
     if kind == "yesno":
-        def on_yes(): result[0] = True;  dlg.destroy()
-        def on_no():  result[0] = False; dlg.destroy()
-        tk.Button(btn_frame, text="Yes", font=btn_font, bg="#22c55e", fg="white",
-                  relief="flat", padx=22, pady=6, command=on_yes).pack(side="left", padx=8)
-        tk.Button(btn_frame, text="No",  font=btn_font, bg="#333355", fg="white",
-                  relief="flat", padx=22, pady=6, command=on_no).pack(side="left", padx=8)
+        def on_yes(): result[0]=True;  dlg.destroy()
+        def on_no():  result[0]=False; dlg.destroy()
+        tk.Button(btn_frame, text="Yes", font=btn_font, bg="#22c55e", fg="white", relief="flat", padx=22, pady=6, command=on_yes).pack(side="left", padx=8)
+        tk.Button(btn_frame, text="No",  font=btn_font, bg="#333355", fg="white", relief="flat", padx=22, pady=6, command=on_no).pack(side="left",  padx=8)
     elif kind == "triple":
-        def on_yes():   result[0] = "yes";  dlg.destroy()
-        def on_extra(): result[0] = "extra"; dlg.destroy()
-        def on_no():    result[0] = "no";   dlg.destroy()
-        tk.Button(btn_frame, text="Yes", font=btn_font, bg="#22c55e", fg="white",
-                  relief="flat", padx=16, pady=6, command=on_yes).pack(side="left", padx=6)
-        tk.Button(btn_frame, text=extra_button or "Other", font=btn_font, bg="#007aff", fg="white",
-                  relief="flat", padx=16, pady=6, command=on_extra).pack(side="left", padx=6)
-        tk.Button(btn_frame, text="No", font=btn_font, bg="#333355", fg="white",
-                  relief="flat", padx=16, pady=6, command=on_no).pack(side="left", padx=6)
+        def on_yes():   result[0]="yes";   dlg.destroy()
+        def on_extra(): result[0]="extra"; dlg.destroy()
+        def on_no():    result[0]="no";    dlg.destroy()
+        tk.Button(btn_frame, text="Yes",                   font=btn_font, bg="#22c55e", fg="white", relief="flat", padx=16, pady=6, command=on_yes).pack(side="left",   padx=6)
+        tk.Button(btn_frame, text=extra_button or "Other", font=btn_font, bg="#007aff", fg="white", relief="flat", padx=16, pady=6, command=on_extra).pack(side="left", padx=6)
+        tk.Button(btn_frame, text="No",                    font=btn_font, bg="#333355", fg="white", relief="flat", padx=16, pady=6, command=on_no).pack(side="left",    padx=6)
     else:
-        tk.Button(btn_frame, text="OK", font=btn_font, bg="#007aff", fg="white",
-                  relief="flat", padx=28, pady=6, command=dlg.destroy).pack()
-
+        tk.Button(btn_frame, text="OK", font=btn_font, bg="#007aff", fg="white", relief="flat", padx=28, pady=6, command=dlg.destroy).pack()
     dlg.mainloop()
     return result[0]
 
@@ -550,10 +464,8 @@ def _topmost_dialog(title: str, message: str, kind: str = "yesno", extra_button:
 def close_popup_if_open():
     root = popup_ref.get("root")
     if root:
-        try:
-            root.destroy()
-        except:
-            pass
+        try: root.destroy()
+        except: pass
         popup_ref["root"] = None
 
 def _fresh_code() -> str:
@@ -565,13 +477,7 @@ def _do_unpair_and_notify():
     flags["we_initiated_unpair"] = True
     clear_paired()
     threadsafe_send({"type": "unpair_from_pc", "device_id": DEVICE_ID})
-    threadsafe_send({
-        "type":        "register",
-        "device_id":   DEVICE_ID,
-        "device_name": DEVICE_NAME,
-        "device_mac":  DEVICE_MAC,
-        "is_paired":   False
-    })
+    threadsafe_send({"type": "register", "device_id": DEVICE_ID, "device_name": DEVICE_NAME, "device_mac": DEVICE_MAC, "is_paired": False})
     print("[AGENT] Unpaired and notified server")
 
 def show_pair_popup():
@@ -584,71 +490,50 @@ def show_pair_popup():
     root = tk.Tk()
     popup_ref["root"] = root
     root.title("PC Control Hub — Pair Device")
-    root.configure(bg="#1a1a2e")
-    root.resizable(False, False)
-    root.attributes("-topmost", True)
-    root.lift()
-    root.focus_force()
+    root.configure(bg="#1a1a2e"); root.resizable(False, False)
+    root.attributes("-topmost", True); root.lift(); root.focus_force()
+    w = 340; h = 480 if QR_AVAILABLE else 280
+    sw = root.winfo_screenwidth(); sh = root.winfo_screenheight()
+    root.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
 
-    w  = 340
-    h  = 480 if QR_AVAILABLE else 280
-    sw = root.winfo_screenwidth()
-    sh = root.winfo_screenheight()
-    root.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
-
-    title_font = tkfont.Font(family="Segoe UI", size=13, weight="bold")
-    body_font  = tkfont.Font(family="Segoe UI", size=10)
+    title_font = tkfont.Font(family="Segoe UI",    size=13, weight="bold")
+    body_font  = tkfont.Font(family="Segoe UI",    size=10)
     code_font  = tkfont.Font(family="Courier New", size=30, weight="bold")
-    small_font = tkfont.Font(family="Segoe UI", size=8)
+    small_font = tkfont.Font(family="Segoe UI",    size=8)
 
-    tk.Label(root, text="PC Control Hub", font=title_font, bg="#1a1a2e", fg="#ffffff").pack(pady=(18, 2))
+    tk.Label(root, text="PC Control Hub", font=title_font, bg="#1a1a2e", fg="#ffffff").pack(pady=(18,2))
     tk.Label(root, text="Scan the QR code or enter the manual\ncode in the app to pair your phone.",
-             font=body_font, bg="#1a1a2e", fg="#aaaaaa", justify="center").pack(pady=(0, 10))
+             font=body_font, bg="#1a1a2e", fg="#aaaaaa", justify="center").pack(pady=(0,10))
 
     if QR_AVAILABLE:
         qr_data = json.dumps({"server": SERVER_URL, "code": code})
         qr = qrcode.QRCode(version=2, error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=6, border=3)
-        qr.add_data(qr_data)
-        qr.make(fit=True)
-        qr_img = qr.make_image(fill_color="black", back_color="white")
-        buf = BytesIO()
-        qr_img.save(buf, format="PNG")
-        buf.seek(0)
+        qr.add_data(qr_data); qr.make(fit=True)
+        qr_img  = qr.make_image(fill_color="black", back_color="white")
+        buf     = BytesIO(); qr_img.save(buf, format="PNG"); buf.seek(0)
         pil_img = Image.open(buf).resize((200, 200), Image.NEAREST)
         tk_img  = ImageTk.PhotoImage(pil_img)
-        qr_frame = tk.Frame(root, bg="white", padx=4, pady=4)
-        qr_frame.pack(pady=(0, 10))
+        qr_frame = tk.Frame(root, bg="white", padx=4, pady=4); qr_frame.pack(pady=(0,10))
         tk.Label(qr_frame, image=tk_img, bg="white").pack()
         root._qr_img = tk_img
 
     tk.Label(root, text="Manual Code", font=body_font, bg="#1a1a2e", fg="#aaaaaa").pack()
-    code_frame = tk.Frame(root, bg="#0f3460", padx=16, pady=10)
-    code_frame.pack(pady=(4, 8))
-    spaced = f"{code[:3]} {code[3:]}"
-    tk.Label(code_frame, text=spaced, font=code_font, bg="#0f3460", fg="#e94560").pack()
+    code_frame = tk.Frame(root, bg="#0f3460", padx=16, pady=10); code_frame.pack(pady=(4,8))
+    tk.Label(code_frame, text=f"{code[:3]} {code[3:]}", font=code_font, bg="#0f3460", fg="#e94560").pack()
 
     timer_var = tk.StringVar(value=f"Expires in {PAIR_CODE_TTL}s")
     tk.Label(root, textvariable=timer_var, font=small_font, bg="#1a1a2e", fg="#666688").pack()
-    tk.Label(root, text=f"Server: {SERVER_URL}", font=small_font, bg="#1a1a2e", fg="#555577").pack(pady=(4, 0))
+    tk.Label(root, text=f"Server: {SERVER_URL}", font=small_font, bg="#1a1a2e", fg="#555577").pack(pady=(4,0))
 
     remaining = [PAIR_CODE_TTL]
-
     def tick():
-        if is_paired():
-            root.destroy()
-            return
+        if is_paired(): root.destroy(); return
         remaining[0] -= 1
         if remaining[0] > 0:
-            timer_var.set(f"Expires in {remaining[0]}s")
-            root.after(1000, tick)
+            timer_var.set(f"Expires in {remaining[0]}s"); root.after(1000, tick)
         else:
-            if not is_paired():
-                print("[AUTO REGENERATE] Timer expired")
-                root.destroy()
-                flags["show_qr"] = True
-            else:
-                root.destroy()
-
+            if not is_paired(): print("[AUTO REGENERATE] Timer expired"); root.destroy(); flags["show_qr"] = True
+            else: root.destroy()
     root.after(1000, tick)
     root.mainloop()
     popup_ref["root"] = None
@@ -657,63 +542,41 @@ def handle_show_qr():
     if is_paired():
         answer = _topmost_dialog(
             "PC Control Hub — Already Paired",
-            f"{DEVICE_NAME} is already paired to a phone.\n\n"
-            "Would you like to unpair and pair with a new phone instead?",
-            kind="triple",
-            extra_button="Unpair & Repair"
+            f"{DEVICE_NAME} is already paired to a phone.\n\nWould you like to unpair and pair with a new phone instead?",
+            kind="triple", extra_button="Unpair & Repair"
         )
         if answer == "extra":
-            _do_unpair_and_notify()
-            time.sleep(0.3)
-            show_pair_popup()
+            _do_unpair_and_notify(); time.sleep(0.3); show_pair_popup()
         return
     show_pair_popup()
 
 def handle_unpaired_dialog():
     repair = _topmost_dialog(
         "PC Control Hub — Device Unpaired",
-        "Your phone has been disconnected from this PC.\n\n"
-        "Would you like to pair with a new phone?",
+        "Your phone has been disconnected from this PC.\n\nWould you like to pair with a new phone?",
         kind="yesno"
     )
     if repair:
         show_pair_popup()
     else:
-        uninstall = _topmost_dialog(
-            "PC Control Hub",
-            "Would you like to uninstall PC Control Hub from this PC?",
-            kind="yesno"
-        )
+        uninstall = _topmost_dialog("PC Control Hub", "Would you like to uninstall PC Control Hub from this PC?", kind="yesno")
         if uninstall:
-            _topmost_dialog(
-                "PC Control Hub",
-                "Thank you for using PC Control Hub!\n\n"
-                "The application will now close.\n"
-                "You can uninstall it from Windows Settings → Apps.",
-                kind="info"
-            )
+            _topmost_dialog("PC Control Hub",
+                "Thank you for using PC Control Hub!\n\nThe application will now close.\nYou can uninstall it from Windows Settings → Apps.",
+                kind="info")
             sys.exit(0)
         else:
             print("[AGENT] Running unpaired in background.")
 
 def handle_tray_unpair():
     if not is_paired():
-        _topmost_dialog("PC Control Hub", "This PC is not currently paired to any phone.", kind="info")
-        return
-
-    result = _topmost_dialog(
-        "Unpair Device",
-        f"This will disconnect your phone from {DEVICE_NAME}.\n\nAre you sure you want to unpair?",
-        kind="yesno"
-    )
-    if not result:
-        return
-
+        _topmost_dialog("PC Control Hub", "This PC is not currently paired to any phone.", kind="info"); return
+    result = _topmost_dialog("Unpair Device",
+        f"This will disconnect your phone from {DEVICE_NAME}.\n\nAre you sure you want to unpair?", kind="yesno")
+    if not result: return
     _do_unpair_and_notify()
-
     again = _topmost_dialog("Pair New Device?", "Would you like to pair this PC with a new phone?", kind="yesno")
-    if again:
-        show_pair_popup()
+    if again: show_pair_popup()
 
 # ─────────────────────────────────────────────
 # Entry point
@@ -726,9 +589,10 @@ if __name__ == "__main__":
     print(f"[AGENT] psutil:    {PSUTIL_AVAILABLE}")
     print(f"[AGENT] GPU:       {GPU_METHOD or 'unavailable'}")
 
+    setup_autostart()
+
     def handle_sigint(sig, frame):
-        print("\n[EXIT] Agent stopped.")
-        sys.exit(0)
+        print("\n[EXIT] Agent stopped."); sys.exit(0)
     signal.signal(signal.SIGINT, handle_sigint)
 
     bg_thread = threading.Thread(target=run_async, daemon=True)
@@ -747,24 +611,8 @@ if __name__ == "__main__":
     print("[AGENT] Running. Right-click the tray icon for options.")
     while True:
         time.sleep(0.4)
-
-        if flags["tray_quit"]:
-            flags["tray_quit"] = False
-            print("[EXIT] Quit from tray.")
-            sys.exit(0)
-
-        if flags["close_popup"]:
-            flags["close_popup"] = False
-            close_popup_if_open()
-
-        if flags["show_qr"]:
-            flags["show_qr"] = False
-            handle_show_qr()
-
-        if flags["show_unpaired"]:
-            flags["show_unpaired"] = False
-            handle_unpaired_dialog()
-
-        if flags["tray_unpair"]:
-            flags["tray_unpair"] = False
-            handle_tray_unpair()
+        if flags["tray_quit"]:     flags["tray_quit"]     = False; print("[EXIT] Quit from tray."); sys.exit(0)
+        if flags["close_popup"]:   flags["close_popup"]   = False; close_popup_if_open()
+        if flags["show_qr"]:       flags["show_qr"]       = False; handle_show_qr()
+        if flags["show_unpaired"]: flags["show_unpaired"] = False; handle_unpaired_dialog()
+        if flags["tray_unpair"]:   flags["tray_unpair"]   = False; handle_tray_unpair()
