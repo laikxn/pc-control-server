@@ -226,14 +226,17 @@ def should_event_fire(event: dict, now_ts: float) -> bool:
         return False
     import datetime
     now_dt  = datetime.datetime.fromtimestamp(now_ts)
-    if now_dt.hour   != event.get("hour",   -1): return False
-    if now_dt.minute != event.get("minute", -1): return False
+    e_hour   = event.get("hour",   -1)
+    e_minute = event.get("minute", -1)
+    if now_dt.hour != e_hour or now_dt.minute != e_minute:
+        return False
     recurrence = event.get("recurrence", "once")
+    # Debounce: don't fire again within the same minute window
+    last_fired = event.get("last_fired", 0)
+    if now_ts - last_fired < 59:
+        return False
     if recurrence == "once":
         return not event.get("fired", False)
-    last_fired = event.get("last_fired", 0)
-    if now_ts - last_fired < 60:
-        return False
     if recurrence == "daily":
         return True
     if recurrence == "weekly":
@@ -306,26 +309,25 @@ async def execute_scheduled_event(device_id: str, event: dict):
                 await asyncio.sleep(2)
         await broadcast_to_mobile({"type": "event_fired", "device_id": device_id, "event_id": event_id, "event_name": name})
         await broadcast_to_mobile({"type": "events_updated", "device_id": device_id, "events": scheduled_events.get(device_id, [])})
-    """Checks all scheduled events every 60 seconds, aligned to the minute."""
-    import datetime
-    # Wait until the start of the next minute so we check right at :00 seconds
-    now = datetime.datetime.now()
-    wait = 60 - now.second - now.microsecond / 1_000_000
-    await asyncio.sleep(wait)
 
+async def scheduler_loop():
+    """Checks all scheduled events every 20 seconds."""
     while True:
+        await asyncio.sleep(20)
         now_ts = time.time()
-        print(f"[SCHEDULER] Tick — checking {sum(len(v) for v in scheduled_events.values())} event(s)")
+        import datetime
+        now_dt = datetime.datetime.fromtimestamp(now_ts)
+        print(f"[SCHEDULER] Tick {now_dt.strftime('%H:%M:%S')} — {sum(len(v) for v in scheduled_events.values())} event(s)")
         for device_id, events in list(scheduled_events.items()):
             for event in events:
                 if should_event_fire(event, now_ts):
+                    print(f"[SCHEDULER] Firing '{event.get('name')}' for {device_id}")
                     event["last_fired"] = now_ts
                     if event.get("recurrence", "once") == "once":
                         event["fired"]   = True
-                        event["enabled"] = False   # auto-disable after firing once
+                        event["enabled"] = False
                     save_events()
                     asyncio.create_task(execute_scheduled_event(device_id, event))
-        await asyncio.sleep(60)
 
 # ─────────────────────────────────────────────
 # Main handler

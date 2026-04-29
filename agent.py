@@ -317,14 +317,26 @@ def wake_on_lan(mac: str) -> bool:
         return False
 
 def run_file(path: str) -> bool:
-    """Run an exe, script, or open any file with its default handler."""
-    print(f"[ACTION] Run file: {path}")
+    """Run an exe, script, steam:// URL, or open any file with its default handler.
+
+    For Steam games, users can provide:
+      - steam://rungameid/730          (CS2 example — launches via Steam properly)
+      - A normal .exe path             (launched directly, may not work for Steam games)
+
+    Using the steam:// protocol is the recommended way to launch Steam games
+    because it ensures Steam loads all required overlays and dependencies.
+    """
+    print(f"[ACTION] Run: {path}")
     try:
         if os.name == "nt":
+            # steam:// and other protocol URLs work fine with os.startfile on Windows
             os.startfile(path)
         else:
             import subprocess
-            subprocess.Popen(["xdg-open", path])
+            if path.startswith("steam://") or path.startswith("http://") or path.startswith("https://"):
+                subprocess.Popen(["xdg-open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
         return True
     except Exception as e:
         print(f"[RUN FILE ERROR] {e}")
