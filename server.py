@@ -551,6 +551,27 @@ async def state_monitor():
             await update_state(dev)
         await asyncio.sleep(3)
 
+async def scheduler_loop():
+    """Checks all scheduled events every 60 seconds, aligned to the minute."""
+    import datetime
+    now = datetime.datetime.now()
+    wait = 60 - now.second - now.microsecond / 1_000_000
+    await asyncio.sleep(wait)
+
+    while True:
+        now_ts = time.time()
+        print(f"[SCHEDULER] Tick — checking {sum(len(v) for v in scheduled_events.values())} event(s)")
+        for device_id, events in list(scheduled_events.items()):
+            for event in events:
+                if should_event_fire(event, now_ts):
+                    event["last_fired"] = now_ts
+                    if event.get("recurrence", "once") == "once":
+                        event["fired"]   = True
+                        event["enabled"] = False
+                    save_events()
+                    asyncio.create_task(execute_scheduled_event(device_id, event))
+        await asyncio.sleep(60)
+
 async def main():
     load_tokens()
     load_events()
