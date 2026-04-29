@@ -222,7 +222,8 @@ flags = {
     "tray_quit":           False,
     "tray_restart":        False,
     "we_initiated_unpair": False,
-    "file_picker_request": None,   # set to {"request_id": str} to trigger main-thread file picker
+    "file_picker_request": None,
+    "volume_subscribed":   False,   # True while mobile has volume screen open
 }
 
 loop_ref      = {"loop": None}
@@ -392,15 +393,13 @@ def get_volume_sessions() -> list:
     return sessions_out
 
 def get_master_volume() -> dict:
-    """Return master volume level and mute state. Called via run_in_executor (already in a thread)."""
+    """Return master volume level and mute state. Called via run_in_executor."""
     if not PYCAW_AVAILABLE:
         return {"volume": 50, "muted": False}
     try:
         import pythoncom
         pythoncom.CoInitialize()
-        devices  = AudioUtilities.GetSpeakers()
-        iface    = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-        endpoint = iface.QueryInterface(IAudioEndpointVolume)
+        endpoint = _get_endpoint_volume()
         volume   = round(endpoint.GetMasterVolumeLevelScalar() * 100)
         muted    = bool(endpoint.GetMute())
         return {"volume": volume, "muted": muted}
@@ -409,63 +408,54 @@ def get_master_volume() -> dict:
         return {"volume": 50, "muted": False}
     finally:
         try:
-            import pythoncom
-            pythoncom.CoUninitialize()
+            import pythoncom; pythoncom.CoUninitialize()
         except: pass
 
+def _get_endpoint_volume():
+    """Get IAudioEndpointVolume — bypasses pycaw version differences."""
+    import comtypes.client
+    # Use pycaw's own device enumeration but activate the interface ourselves
+    from pycaw.pycaw import AudioUtilities
+    speakers = AudioUtilities.GetSpeakers()
+    # In newer pycaw, speakers is an AudioDevice with an _dev COM object inside
+    if hasattr(speakers, '_dev'):
+        device = speakers._dev
+    elif hasattr(speakers, 'Activate'):
+        device = speakers
+    else:
+        # Fall back: enumerate via IMMDeviceEnumerator through comtypes
+        import comtypes
+        IMMDeviceEnumerator_IID = comtypes.GUID("{A95664D2-9614-4F35-A746-DE8DB63617E6}")
+        MMDeviceEnumerator_CLSID = comtypes.GUID("{BCDE0395-E52F-467C-8E3D-C4579291692E}")
+        enumerator = comtypes.CoCreateInstance(
+            MMDeviceEnumerator_CLSID, None, CLSCTX_ALL, IMMDeviceEnumerator_IID
+        )
+        device = enumerator.GetDefaultAudioEndpoint(0, 1)
+
+    iface    = device.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+    endpoint = iface.QueryInterface(IAudioEndpointVolume)
+    return endpoint
+
 def set_master_volume(volume: float, muted: bool | None = None) -> bool:
-    """Set the master volume level. Called via run_in_executor (already in a thread)."""
+    """Set the master volume level. Called via run_in_executor."""
     if not PYCAW_AVAILABLE:
-        print("[VOLUME] pycaw not available")
         return False
     try:
         import pythoncom
-        print(f"[VOLUME] set_master_volume called: volume={volume}, muted={muted}")
         pythoncom.CoInitialize()
-        print("[VOLUME] CoInitialize OK")
-        devices  = AudioUtilities.GetSpeakers()
-        print(f"[VOLUME] GetSpeakers OK: {devices}")
-        iface    = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-        print("[VOLUME] Activate OK")
-        endpoint = iface.QueryInterface(IAudioEndpointVolume)
-        print("[VOLUME] QueryInterface OK")
-        scalar = max(0.0, min(1.0, volume / 100))
-        endpoint.SetMasterVolumeLevelScalar(scalar, None)
-        print(f"[VOLUME] SetMasterVolumeLevelScalar({scalar}) OK")
+        endpoint = _get_endpoint_volume()
+        endpoint.SetMasterVolumeLevelScalar(max(0.0, min(1.0, volume / 100)), None)
         if muted is not None:
             endpoint.SetMute(int(muted), None)
-            print(f"[VOLUME] SetMute({muted}) OK")
+        print(f"[VOLUME] Master set to {volume}%")
         return True
     except Exception as e:
-        print(f"[VOLUME] Set master error: {type(e).__name__}: {e}")
-        import traceback; traceback.print_exc()
+        print(f"[VOLUME] Set master error: {e}")
         return False
     finally:
         try:
-            import pythoncom
-            pythoncom.CoUninitialize()
+            import pythoncom; pythoncom.CoUninitialize()
         except: pass
-    """Set volume/mute for an audio session by process ID."""
-    if not PYCAW_AVAILABLE:
-        return False
-    try:
-        sessions = AudioUtilities.GetAllSessions()
-        changed = False
-        for s in sessions:
-            # Match by PID, or match all system sessions if pid == "0"
-            if str(s.ProcessId) == str(pid) or (pid == "0" and not s.Process):
-                try:
-                    vol_iface = s._ctl.QueryInterface(ISimpleAudioVolume)
-                    vol_iface.SetMasterVolume(max(0.0, min(1.0, volume / 100)), None)
-                    if muted is not None:
-                        vol_iface.SetMute(int(muted), None)
-                    changed = True
-                except:
-                    pass
-        return changed
-    except Exception as e:
-        print(f"[VOLUME] Set session error: {e}")
-    return False
 
 def set_session_volume(pid: str, volume: float, muted: bool | None = None) -> bool:
     """Set volume/mute for an audio session. Called via run_in_executor (already in a thread)."""
@@ -692,24 +682,30 @@ async def send_stats_loop(ws):
         await asyncio.sleep(STATS_INTERVAL)
 
 async def send_volume_loop(ws):
-    """Push volume data every 3 seconds so the app stays in sync with PC-side changes."""
+    """Poll volume every 1s — but only while the mobile has the volume screen open."""
     if not PYCAW_AVAILABLE:
         return
-    await asyncio.sleep(2)  # slight delay on startup
+    last_master   = None
+    last_sessions = None
     while True:
+        await asyncio.sleep(1)
+        if not flags.get("volume_subscribed"):
+            continue
         try:
-            loop   = asyncio.get_event_loop()
+            loop     = asyncio.get_event_loop()
             master   = await loop.run_in_executor(None, get_master_volume)
             sessions = await loop.run_in_executor(None, get_volume_sessions)
-            await ws.send(json.dumps({
-                "type":     "volume_data",
-                "device_id": DEVICE_ID,
-                "master":   master,
-                "sessions": sessions,
-            }))
+            if master != last_master or sessions != last_sessions:
+                last_master   = master
+                last_sessions = sessions
+                await ws.send(json.dumps({
+                    "type":      "volume_data",
+                    "device_id": DEVICE_ID,
+                    "master":    master,
+                    "sessions":  sessions,
+                }))
         except Exception as e:
             print("[VOLUME LOOP ERROR]", e); break
-        await asyncio.sleep(3)
 
 async def handle_command(cmd, ws):
     t      = cmd.get("type")
@@ -742,16 +738,24 @@ async def handle_command(cmd, ws):
             flags["file_picker_request"] = {"request_id": request_id}
             return
         elif t == "get_volume":
-            # Run blocking COM calls in executor so we don't block the event loop
-            loop = asyncio.get_event_loop()
+            flags["volume_subscribed"] = True
+            loop     = asyncio.get_event_loop()
             master   = await loop.run_in_executor(None, get_master_volume)
             sessions = await loop.run_in_executor(None, get_volume_sessions)
             await ws.send(json.dumps({
-                "type":     "volume_data",
+                "type":      "volume_data",
                 "device_id": DEVICE_ID,
-                "master":   master,
-                "sessions": sessions,
+                "master":    master,
+                "sessions":  sessions,
             }))
+            return
+        elif t == "volume_subscribe":
+            flags["volume_subscribed"] = True
+            print("[VOLUME] Subscribed — polling active")
+            return
+        elif t == "volume_unsubscribe":
+            flags["volume_subscribed"] = False
+            print("[VOLUME] Unsubscribed — polling paused")
             return
         elif t == "set_master_volume":
             vol   = cmd.get("volume")

@@ -567,7 +567,8 @@ async def handler(ws):
                 except: pass
 
             # ── VOLUME: MOBILE → AGENT ──
-            elif msg_type in ["get_volume", "set_master_volume", "set_session_volume"]:
+            elif msg_type in ["get_volume", "set_master_volume", "set_session_volume",
+                               "volume_subscribe", "volume_unsubscribe"]:
                 target_id = data.get("device_id"); token = data.get("token", "")
                 if not target_id: continue
                 if target_id in device_tokens and not validate_token(target_id, token):
