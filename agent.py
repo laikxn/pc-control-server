@@ -8,7 +8,7 @@ Install dependencies:
 
 First run: shows QR popup for pairing.
 After pairing: runs silently in system tray.
-Tray right-click: Pair / Repair Device | Unpair Device | Quit
+Tray right-click: Pair / Repair Device | Unpair Device | Restart Agent | Quit
 """
 
 import asyncio
@@ -23,7 +23,7 @@ import random
 import signal
 import sys
 import tkinter as tk
-from tkinter import font as tkfont
+from tkinter import font as tkfont, filedialog
 from io import BytesIO
 
 try:
@@ -67,6 +67,7 @@ except ImportError:
 SERVER_URL         = "ws://192.168.1.230:8000"
 DEVICE_ID_FILE     = "device_id.txt"
 PAIRED_FILE        = "paired.json"
+STARTUP_QUEUE_FILE = "startup_queue.json"
 PAIR_CODE_TTL      = 120
 STATS_INTERVAL     = 3
 AUTOSTART_REG_NAME = "PCControlHubAgent"
@@ -136,6 +137,57 @@ def clear_paired():
     save_paired(False)
 
 # ─────────────────────────────────────────────
+# Startup queue
+# Only executes when wake_triggered=True (i.e. Wake PC was step 1 of a scheduled event)
+# This ensures files don't open unexpectedly on a normal PC boot
+# ─────────────────────────────────────────────
+def load_startup_queue() -> list:
+    if not os.path.exists(STARTUP_QUEUE_FILE):
+        return []
+    try:
+        with open(STARTUP_QUEUE_FILE, "r") as f:
+            data = json.load(f)
+        if data.get("wake_triggered", False):
+            return data.get("steps", [])
+        return []
+    except:
+        return []
+
+def save_startup_queue(steps: list, wake_triggered: bool = False):
+    with open(STARTUP_QUEUE_FILE, "w") as f:
+        json.dump({"steps": steps, "wake_triggered": wake_triggered}, f)
+
+def clear_startup_queue():
+    if os.path.exists(STARTUP_QUEUE_FILE):
+        try:
+            os.remove(STARTUP_QUEUE_FILE)
+        except:
+            pass
+
+def execute_startup_queue():
+    """Run queued steps from a wake-first scheduled event. Called on first connect after boot."""
+    steps = load_startup_queue()
+    if not steps:
+        return
+    print(f"[STARTUP QUEUE] Executing {len(steps)} queued step(s)")
+    clear_startup_queue()
+    time.sleep(4)  # Wait for desktop to fully load
+    for step in steps:
+        stype = step.get("type")
+        if stype == "run_file":
+            path = step.get("path", "")
+            if path:
+                print(f"[STARTUP QUEUE] Running: {path}")
+                run_file(path)
+                time.sleep(1)
+        elif stype == "shutdown_pc":
+            shutdown_pc()
+        elif stype == "restart_pc":
+            restart_pc()
+        elif stype == "lock_pc":
+            lock_pc()
+
+# ─────────────────────────────────────────────
 # Flags
 # ─────────────────────────────────────────────
 flags = {
@@ -144,7 +196,9 @@ flags = {
     "show_unpaired":       False,
     "tray_unpair":         False,
     "tray_quit":           False,
+    "tray_restart":        False,
     "we_initiated_unpair": False,
+    "file_picker_request": None,   # set to {"request_id": str} to trigger main-thread file picker
 }
 
 loop_ref      = {"loop": None}
@@ -239,18 +293,15 @@ def collect_stats() -> dict:
 # ─────────────────────────────────────────────
 def shutdown_pc() -> bool:
     print("[ACTION] Shutdown")
-    result = os.system("shutdown /s /t 0 /f")
-    return result == 0
+    return os.system("shutdown /s /t 0 /f") == 0
 
 def restart_pc() -> bool:
     print("[ACTION] Restart")
-    result = os.system("shutdown /r /t 0 /f")
-    return result == 0
+    return os.system("shutdown /r /t 0 /f") == 0
 
 def lock_pc() -> bool:
     print("[ACTION] Lock")
-    result = os.system("rundll32.exe user32.dll,LockWorkStation")
-    return result == 0
+    return os.system("rundll32.exe user32.dll,LockWorkStation") == 0
 
 def wake_on_lan(mac: str) -> bool:
     try:
@@ -263,6 +314,20 @@ def wake_on_lan(mac: str) -> bool:
         return True
     except Exception as e:
         print("[WOL ERROR]", e)
+        return False
+
+def run_file(path: str) -> bool:
+    """Run an exe, script, or open any file with its default handler."""
+    print(f"[ACTION] Run file: {path}")
+    try:
+        if os.name == "nt":
+            os.startfile(path)
+        else:
+            import subprocess
+            subprocess.Popen(["xdg-open", path])
+        return True
+    except Exception as e:
+        print(f"[RUN FILE ERROR] {e}")
         return False
 
 # ─────────────────────────────────────────────
@@ -288,7 +353,6 @@ async def _register_and_code(ws):
         await ws.send(json.dumps({
             "type": "set_pair_code", "device_id": DEVICE_ID, "code": pair_code_ref["code"]
         }))
-        print(f"[PAIR CODE REGISTERED] {pair_code_ref['code']}")
 
 def threadsafe_register_and_code():
     ws = ws_ref.get("ws"); loop = loop_ref.get("loop")
@@ -324,21 +388,35 @@ async def handle_command(cmd, ws):
     status = "executed"
     try:
         if t == "shutdown_pc":
-            ok = shutdown_pc()
-            if not ok: status = "failed"
+            if not shutdown_pc(): status = "failed"
         elif t == "restart_pc":
-            ok = restart_pc()
-            if not ok: status = "failed"
+            if not restart_pc(): status = "failed"
         elif t == "lock_pc":
-            ok = lock_pc()
-            if not ok: status = "failed"
+            if not lock_pc(): status = "failed"
         elif t == "wake_pc":
             mac = cmd.get("mac")
             if mac:
-                ok = wake_on_lan(mac)
-                if not ok: status = "failed"
+                if not wake_on_lan(mac): status = "failed"
             else:
                 status = "failed"
+        elif t == "run_custom_action":
+            path = cmd.get("path", "")
+            if path:
+                if not run_file(path): status = "failed"
+            else:
+                status = "failed"
+        elif t == "open_file_picker":
+            # Signal main thread to open file dialog — result sent async, no ack here
+            request_id = cmd.get("request_id", str(uuid.uuid4()))
+            flags["file_picker_request"] = {"request_id": request_id}
+            return
+        elif t == "save_startup_queue":
+            # Server telling agent to save remaining steps for after-wake execution
+            steps = cmd.get("steps", [])
+            if steps:
+                save_startup_queue(steps, wake_triggered=True)
+                print(f"[STARTUP QUEUE] Saved {len(steps)} step(s) for post-wake execution")
+            return
         elif t == "reload_agent":
             os._exit(0)
         elif t == "pair_confirmed":
@@ -349,7 +427,6 @@ async def handle_command(cmd, ws):
             clear_paired()
             print("[UNPAIRED] Received from server")
             if flags["we_initiated_unpair"]:
-                print("[UNPAIRED] Suppressing echo — we initiated this unpair")
                 flags["we_initiated_unpair"] = False
             else:
                 flags["show_unpaired"] = True
@@ -361,6 +438,10 @@ async def handle_command(cmd, ws):
         await ws.send(json.dumps({"type": "ack", "command_id": cmd_id, "status": status}))
 
 async def connect():
+    # Check for startup queue before first connect (from wake-first scheduled events)
+    startup_queue_pending  = bool(load_startup_queue())
+    startup_queue_started  = False
+
     while True:
         try:
             async with websockets.connect(SERVER_URL) as ws:
@@ -375,6 +456,11 @@ async def connect():
                         "type": "set_pair_code", "device_id": DEVICE_ID, "code": pair_code_ref["code"]
                     }))
                     print(f"[PAIR CODE REGISTERED] {pair_code_ref['code']}")
+
+                # Execute startup queue on first connect only
+                if startup_queue_pending and not startup_queue_started:
+                    startup_queue_started = True
+                    threading.Thread(target=execute_startup_queue, daemon=True).start()
 
                 heartbeat_task = asyncio.create_task(send_heartbeat(ws))
                 stats_task     = asyncio.create_task(send_stats_loop(ws))
@@ -403,9 +489,10 @@ def run_async():
 # ─────────────────────────────────────────────
 # Tray
 # ─────────────────────────────────────────────
-def tray_on_pair(icon, item):   flags["show_qr"]     = True
-def tray_on_unpair(icon, item): flags["tray_unpair"] = True
-def tray_on_quit(icon, item):   flags["tray_quit"]   = True
+def tray_on_pair(icon, item):    flags["show_qr"]      = True
+def tray_on_unpair(icon, item):  flags["tray_unpair"]  = True
+def tray_on_restart(icon, item): flags["tray_restart"] = True
+def tray_on_quit(icon, item):    flags["tray_quit"]    = True
 
 def make_tray_image():
     img  = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
@@ -419,11 +506,45 @@ def start_tray():
         pystray.MenuItem("Pair / Repair Device", tray_on_pair),
         pystray.MenuItem("Unpair Device",         tray_on_unpair),
         pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Restart Agent",         tray_on_restart),
         pystray.MenuItem("Quit",                  tray_on_quit),
     )
     icon = pystray.Icon("PC Control Hub", make_tray_image(), "PC Control Hub", menu)
     tray_ref["icon"] = icon
     icon.run()
+
+# ─────────────────────────────────────────────
+# File picker — must run on main thread (tkinter requirement)
+# ─────────────────────────────────────────────
+def handle_file_picker_request(request_id: str):
+    """Opens a Windows file dialog and sends the selected path back via WebSocket."""
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        root.lift()
+        root.focus_force()
+        path = filedialog.askopenfilename(
+            title="Select File for Custom Action",
+            filetypes=[
+                ("Executables & Scripts", "*.exe *.bat *.cmd *.ps1"),
+                ("All Files", "*.*"),
+            ],
+            parent=root,
+        )
+        root.destroy()
+        result = path if path else None
+        print(f"[FILE PICKER] Selected: {result}")
+    except Exception as e:
+        print(f"[FILE PICKER ERROR] {e}")
+        result = None
+
+    threadsafe_send({
+        "type":       "file_picker_result",
+        "request_id": request_id,
+        "path":       result,
+        "device_id":  DEVICE_ID,
+    })
 
 # ─────────────────────────────────────────────
 # Custom topmost dialog
@@ -532,7 +653,7 @@ def show_pair_popup():
         if remaining[0] > 0:
             timer_var.set(f"Expires in {remaining[0]}s"); root.after(1000, tick)
         else:
-            if not is_paired(): print("[AUTO REGENERATE] Timer expired"); root.destroy(); flags["show_qr"] = True
+            if not is_paired(): root.destroy(); flags["show_qr"] = True
             else: root.destroy()
     root.after(1000, tick)
     root.mainloop()
@@ -578,6 +699,16 @@ def handle_tray_unpair():
     again = _topmost_dialog("Pair New Device?", "Would you like to pair this PC with a new phone?", kind="yesno")
     if again: show_pair_popup()
 
+def handle_tray_restart():
+    """Restart the agent process in place."""
+    print("[RESTART] Restarting agent...")
+    try:
+        icon = tray_ref.get("icon")
+        if icon: icon.stop()
+    except: pass
+    time.sleep(0.3)
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
 # ─────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────
@@ -611,8 +742,26 @@ if __name__ == "__main__":
     print("[AGENT] Running. Right-click the tray icon for options.")
     while True:
         time.sleep(0.4)
-        if flags["tray_quit"]:     flags["tray_quit"]     = False; print("[EXIT] Quit from tray."); sys.exit(0)
-        if flags["close_popup"]:   flags["close_popup"]   = False; close_popup_if_open()
-        if flags["show_qr"]:       flags["show_qr"]       = False; handle_show_qr()
-        if flags["show_unpaired"]: flags["show_unpaired"] = False; handle_unpaired_dialog()
-        if flags["tray_unpair"]:   flags["tray_unpair"]   = False; handle_tray_unpair()
+        if flags["tray_quit"]:
+            flags["tray_quit"] = False
+            print("[EXIT] Quit from tray."); sys.exit(0)
+        if flags["tray_restart"]:
+            flags["tray_restart"] = False
+            handle_tray_restart()
+        if flags["close_popup"]:
+            flags["close_popup"] = False
+            close_popup_if_open()
+        if flags["show_qr"]:
+            flags["show_qr"] = False
+            handle_show_qr()
+        if flags["show_unpaired"]:
+            flags["show_unpaired"] = False
+            handle_unpaired_dialog()
+        if flags["tray_unpair"]:
+            flags["tray_unpair"] = False
+            handle_tray_unpair()
+        # File picker must run on main thread (tkinter requirement)
+        fp = flags.get("file_picker_request")
+        if fp:
+            flags["file_picker_request"] = None
+            handle_file_picker_request(fp["request_id"])
