@@ -274,15 +274,21 @@ async def execute_scheduled_event(device_id: str, event: dict):
                 await send_to_device(device_id, {"type": "save_startup_queue", "steps": agent_steps})
 
         await broadcast_to_mobile({"type": "event_fired", "device_id": device_id, "event_id": event_id, "event_name": name})
+        # Push updated event list so mobile knows the event is now disabled
+        await broadcast_to_mobile({"type": "events_updated", "device_id": device_id, "events": scheduled_events.get(device_id, [])})
 
     elif not pc_online:
-        # PC offline, no wake step — can't run. Queue notification.
+        # PC offline, no wake step — can't run.
         print(f"[EVENT] '{name}' skipped — {device_id} is offline")
         notif = {"type": "event_failed", "event_id": event_id, "event_name": name,
                  "reason": "offline", "timestamp": time.time()}
-        queue_notification(device_id, notif)
-        await broadcast_to_mobile({"type": "event_failed", "device_id": device_id,
-                                   "event_id": event_id, "event_name": name, "reason": "offline"})
+        if mobile_clients:
+            # Mobile is open — send live, don't persist
+            await broadcast_to_mobile({"type": "event_failed", "device_id": device_id,
+                                       "event_id": event_id, "event_name": name, "reason": "offline"})
+        else:
+            # Mobile is closed — queue for next open
+            queue_notification(device_id, notif)
     else:
         # PC online — run steps sequentially
         for step in steps:
@@ -299,20 +305,27 @@ async def execute_scheduled_event(device_id: str, event: dict):
                 else:   await send_to_device(device_id, {"type": "wake_pc"})
                 await asyncio.sleep(2)
         await broadcast_to_mobile({"type": "event_fired", "device_id": device_id, "event_id": event_id, "event_name": name})
+        await broadcast_to_mobile({"type": "events_updated", "device_id": device_id, "events": scheduled_events.get(device_id, [])})
+    """Checks all scheduled events every 60 seconds, aligned to the minute."""
+    import datetime
+    # Wait until the start of the next minute so we check right at :00 seconds
+    now = datetime.datetime.now()
+    wait = 60 - now.second - now.microsecond / 1_000_000
+    await asyncio.sleep(wait)
 
-async def scheduler_loop():
-    """Checks all scheduled events every 30 seconds."""
     while True:
-        await asyncio.sleep(30)
         now_ts = time.time()
+        print(f"[SCHEDULER] Tick — checking {sum(len(v) for v in scheduled_events.values())} event(s)")
         for device_id, events in list(scheduled_events.items()):
             for event in events:
                 if should_event_fire(event, now_ts):
                     event["last_fired"] = now_ts
                     if event.get("recurrence", "once") == "once":
-                        event["fired"] = True
+                        event["fired"]   = True
+                        event["enabled"] = False   # auto-disable after firing once
                     save_events()
                     asyncio.create_task(execute_scheduled_event(device_id, event))
+        await asyncio.sleep(60)
 
 # ─────────────────────────────────────────────
 # Main handler
