@@ -410,22 +410,57 @@ def get_volume_sessions() -> list:
     return sessions_out
 
 def get_master_volume() -> dict:
-    """Return master volume level and mute state."""
+    """Return master volume level and mute state. Runs in a COM-initialized thread."""
     if not PYCAW_AVAILABLE:
         return {"volume": 50, "muted": False}
-    try:
-        devices  = AudioUtilities.GetSpeakers()
-        iface    = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-        endpoint = iface.QueryInterface(IAudioEndpointVolume)
-        # GetMasterVolumeLevelScalar returns 0.0–1.0
-        volume = round(endpoint.GetMasterVolumeLevelScalar() * 100)
-        muted  = bool(endpoint.GetMute())
-        return {"volume": volume, "muted": muted}
-    except Exception as e:
-        print(f"[VOLUME] Master volume error: {e}")
-        return {"volume": 50, "muted": False}
+    result = [{"volume": 50, "muted": False}]
+    def _run():
+        try:
+            import pythoncom
+            pythoncom.CoInitialize()
+            devices  = AudioUtilities.GetSpeakers()
+            iface    = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+            endpoint = iface.QueryInterface(IAudioEndpointVolume)
+            volume   = round(endpoint.GetMasterVolumeLevelScalar() * 100)
+            muted    = bool(endpoint.GetMute())
+            result[0] = {"volume": volume, "muted": muted}
+        except Exception as e:
+            print(f"[VOLUME] Master volume error: {e}")
+        finally:
+            try:
+                import pythoncom
+                pythoncom.CoUninitialize()
+            except: pass
+    t = threading.Thread(target=_run)
+    t.start(); t.join(timeout=3)
+    return result[0]
 
-def set_session_volume(pid: str, volume: float, muted: bool | None = None) -> bool:
+def set_master_volume(volume: float, muted: bool | None = None) -> bool:
+    """Set the master volume level. Runs in a COM-initialized thread."""
+    if not PYCAW_AVAILABLE:
+        return False
+    result = [False]
+    def _run():
+        try:
+            import pythoncom
+            pythoncom.CoInitialize()
+            devices  = AudioUtilities.GetSpeakers()
+            iface    = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+            endpoint = iface.QueryInterface(IAudioEndpointVolume)
+            endpoint.SetMasterVolumeLevelScalar(max(0.0, min(1.0, volume / 100)), None)
+            if muted is not None:
+                endpoint.SetMute(int(muted), None)
+            result[0] = True
+        except Exception as e:
+            print(f"[VOLUME] Set master error: {e}")
+        finally:
+            try:
+                import pythoncom
+                pythoncom.CoUninitialize()
+            except: pass
+    t = threading.Thread(target=_run)
+    t.start(); t.join(timeout=3)
+    return result[0]
     """Set volume/mute for an audio session by process ID."""
     if not PYCAW_AVAILABLE:
         return False
@@ -448,23 +483,7 @@ def set_session_volume(pid: str, volume: float, muted: bool | None = None) -> bo
         print(f"[VOLUME] Set session error: {e}")
     return False
 
-def set_master_volume(volume: float, muted: bool | None = None) -> bool:
-    """Set the master volume level."""
-    if not PYCAW_AVAILABLE:
-        return False
-    try:
-        devices  = AudioUtilities.GetSpeakers()
-        iface    = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-        endpoint = iface.QueryInterface(IAudioEndpointVolume)
-        endpoint.SetMasterVolumeLevelScalar(max(0.0, min(1.0, volume / 100)), None)
-        if muted is not None:
-            endpoint.SetMute(int(muted), None)
-        return True
-    except Exception as e:
-        print(f"[VOLUME] Set master error: {e}")
-        return False
-
-def wake_on_lan(mac: str) -> bool:
+def set_session_volume(pid: str, volume: float, muted: bool | None = None) -> bool:
     try:
         mac_bytes = bytes.fromhex(mac.replace(":", "").replace("-", ""))
         packet    = b"\xff" * 6 + mac_bytes * 16
@@ -826,11 +845,13 @@ def handle_file_picker_request(request_id: str):
     try:
         root = tk.Tk()
         root.withdraw()
-        # Bring to front initially, then remove topmost so user can move/minimize it
+        # Prevent maximize — maximized tkinter windows can't be dragged by title bar
+        root.resizable(True, True)
         root.attributes("-topmost", True)
         root.lift()
         root.focus_force()
         root.update()
+        # Remove topmost after 200ms so user can switch windows behind it
         root.after(200, lambda: root.attributes("-topmost", False))
         path = filedialog.askopenfilename(
             title="Select File for Custom Action — PC Control Hub",
