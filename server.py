@@ -39,6 +39,9 @@ scheduled_events = {}
 # Flushed to mobile on next register_mobile
 queued_notifications = {}
 
+# pending_volume_requests: device_id -> origin mobile ws
+pending_volume_requests = {}
+
 # UTC offset in seconds sent by mobile on register, used for event scheduling
 # e.g. EST = -18000, CDT = -14400
 mobile_utc_offset = 0
@@ -562,6 +565,30 @@ async def handler(ws):
                 try:
                     await ws.send(json.dumps({"type": "events_data", "device_id": target_id, "events": scheduled_events.get(target_id, [])}))
                 except: pass
+
+            # ── VOLUME: MOBILE → AGENT ──
+            elif msg_type in ["get_volume", "set_master_volume", "set_session_volume"]:
+                target_id = data.get("device_id"); token = data.get("token", "")
+                if not target_id: continue
+                if target_id in device_tokens and not validate_token(target_id, token):
+                    await reject_token(ws, target_id); continue
+                # Forward to agent; store origin so we can relay volume_data back
+                payload = {k:v for k,v in data.items() if k != "token"}
+                if msg_type == "get_volume":
+                    # Store the requesting mobile ws so we can send volume_data back
+                    pending_volume_requests[target_id] = ws
+                await send_to_device(target_id, payload)
+
+            # ── VOLUME DATA FROM AGENT → MOBILE ──
+            elif msg_type == "volume_data":
+                dev_id = data.get("device_id")
+                if dev_id and dev_id in pending_volume_requests:
+                    origin_ws = pending_volume_requests.pop(dev_id)
+                    try:    await origin_ws.send(json.dumps(data))
+                    except: pass
+                else:
+                    # Broadcast to all mobile clients if no pending request
+                    await broadcast_to_mobile(data)
 
     except Exception as e:
         print("[WS ERROR]", e)

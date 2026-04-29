@@ -5,6 +5,7 @@ Runs silently on your Windows PC after first pairing.
 Install dependencies:
     pip install websockets qrcode pillow pystray psutil
     pip install GPUtil  (optional, Nvidia GPU stats)
+    pip install pycaw   (optional, Windows volume mixer)
 
 First run: shows QR popup for pairing.
 After pairing: runs silently in system tray.
@@ -60,6 +61,16 @@ except ImportError:
         print("[GPU] Using WMI (AMD/Intel fallback)")
     except ImportError:
         print("[GPU] No GPU library available — GPU stats disabled")
+
+PYCAW_AVAILABLE = False
+if os.name == "nt":
+    try:
+        from pycaw.pycaw import AudioUtilities, ISimpleAudioVolume, IAudioEndpointVolume
+        from comtypes import CLSCTX_ALL
+        PYCAW_AVAILABLE = True
+        print("[AUDIO] pycaw available")
+    except ImportError:
+        print("[WARN] pycaw not installed. Run: pip install pycaw  (Windows volume mixer disabled)")
 
 # ─────────────────────────────────────────────
 # Config
@@ -171,7 +182,20 @@ def execute_startup_queue():
         return
     print(f"[STARTUP QUEUE] Executing {len(steps)} queued step(s)")
     clear_startup_queue()
-    time.sleep(4)  # Wait for desktop to fully load
+
+    # Wait for desktop to be fully loaded and unlocked (max 3 minutes)
+    print("[STARTUP QUEUE] Waiting for desktop to be ready...")
+    for _ in range(180):
+        time.sleep(1)
+        if not is_session_locked():
+            break
+    else:
+        print("[STARTUP QUEUE] Timed out waiting for unlock — skipping queue")
+        return
+
+    time.sleep(2)  # Extra buffer after unlock for desktop to settle
+    print("[STARTUP QUEUE] Desktop ready, running steps")
+
     for step in steps:
         stype = step.get("type")
         if stype == "run_file":
@@ -302,6 +326,100 @@ def restart_pc() -> bool:
 def lock_pc() -> bool:
     print("[ACTION] Lock")
     return os.system("rundll32.exe user32.dll,LockWorkStation") == 0
+
+# ─────────────────────────────────────────────
+# Volume control (Windows only, requires pycaw)
+# ─────────────────────────────────────────────
+def is_session_locked() -> bool:
+    """Check if the Windows session is currently locked."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        hdesk = ctypes.windll.user32.OpenInputDesktop(0, False, 0x0100)
+        if hdesk:
+            ctypes.windll.user32.CloseDesktop(hdesk)
+            return False
+        return True
+    except:
+        return False
+
+def get_volume_sessions() -> list:
+    """Return all active audio sessions with name, volume, muted state."""
+    if not PYCAW_AVAILABLE:
+        return []
+    sessions_out = []
+    try:
+        sessions = AudioUtilities.GetAllSessions()
+        for s in sessions:
+            try:
+                vol_iface = s._ctl.QueryInterface(ISimpleAudioVolume)
+                volume    = round(vol_iface.GetMasterVolume() * 100)
+                muted     = bool(vol_iface.GetMute())
+                if s.Process:
+                    name = s.Process.name().replace(".exe", "")
+                else:
+                    name = "System"
+                sessions_out.append({
+                    "id":     str(s.ProcessId),
+                    "name":   name,
+                    "volume": volume,
+                    "muted":  muted,
+                })
+            except:
+                pass
+    except Exception as e:
+        print(f"[VOLUME] Error reading sessions: {e}")
+    return sessions_out
+
+def get_master_volume() -> dict:
+    """Return master volume level and mute state."""
+    if not PYCAW_AVAILABLE:
+        return {"volume": 50, "muted": False}
+    try:
+        devices  = AudioUtilities.GetSpeakers()
+        iface    = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        endpoint = iface.QueryInterface(IAudioEndpointVolume)
+        # GetMasterVolumeLevelScalar returns 0.0–1.0
+        volume = round(endpoint.GetMasterVolumeLevelScalar() * 100)
+        muted  = bool(endpoint.GetMute())
+        return {"volume": volume, "muted": muted}
+    except Exception as e:
+        print(f"[VOLUME] Master volume error: {e}")
+        return {"volume": 50, "muted": False}
+
+def set_session_volume(pid: str, volume: float, muted: bool | None = None) -> bool:
+    """Set volume/mute for an audio session by process ID."""
+    if not PYCAW_AVAILABLE:
+        return False
+    try:
+        sessions = AudioUtilities.GetAllSessions()
+        for s in sessions:
+            if str(s.ProcessId) == str(pid):
+                vol_iface = s._ctl.QueryInterface(ISimpleAudioVolume)
+                vol_iface.SetMasterVolume(max(0.0, min(1.0, volume / 100)), None)
+                if muted is not None:
+                    vol_iface.SetMute(int(muted), None)
+                return True
+    except Exception as e:
+        print(f"[VOLUME] Set session error: {e}")
+    return False
+
+def set_master_volume(volume: float, muted: bool | None = None) -> bool:
+    """Set the master volume level."""
+    if not PYCAW_AVAILABLE:
+        return False
+    try:
+        devices  = AudioUtilities.GetSpeakers()
+        iface    = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        endpoint = iface.QueryInterface(IAudioEndpointVolume)
+        endpoint.SetMasterVolumeLevelScalar(max(0.0, min(1.0, volume / 100)), None)
+        if muted is not None:
+            endpoint.SetMute(int(muted), None)
+        return True
+    except Exception as e:
+        print(f"[VOLUME] Set master error: {e}")
+        return False
 
 def wake_on_lan(mac: str) -> bool:
     try:
@@ -525,10 +643,35 @@ async def handle_command(cmd, ws):
             else:
                 status = "failed"
         elif t == "open_file_picker":
-            # Signal main thread to open file dialog — result sent async, no ack here
             request_id = cmd.get("request_id", str(uuid.uuid4()))
             flags["file_picker_request"] = {"request_id": request_id}
             return
+        elif t == "get_volume":
+            # Return current master + all session volumes
+            master   = get_master_volume()
+            sessions = get_volume_sessions()
+            await ws.send(json.dumps({
+                "type":     "volume_data",
+                "device_id": DEVICE_ID,
+                "master":   master,
+                "sessions": sessions,
+            }))
+            return
+        elif t == "set_master_volume":
+            vol   = cmd.get("volume")
+            muted = cmd.get("muted")
+            if vol is not None:
+                if not set_master_volume(float(vol), muted): status = "failed"
+            else:
+                status = "failed"
+        elif t == "set_session_volume":
+            pid   = cmd.get("pid")
+            vol   = cmd.get("volume")
+            muted = cmd.get("muted")
+            if pid is not None and vol is not None:
+                if not set_session_volume(str(pid), float(vol), muted): status = "failed"
+            else:
+                status = "failed"
         elif t == "save_startup_queue":
             # Server telling agent to save remaining steps for after-wake execution
             steps = cmd.get("steps", [])
