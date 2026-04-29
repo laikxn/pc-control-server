@@ -826,13 +826,16 @@ def handle_file_picker_request(request_id: str):
     try:
         root = tk.Tk()
         root.withdraw()
+        # Bring to front initially, then remove topmost so user can move/minimize it
         root.attributes("-topmost", True)
         root.lift()
         root.focus_force()
+        root.update()
+        root.after(200, lambda: root.attributes("-topmost", False))
         path = filedialog.askopenfilename(
-            title="Select File for Custom Action",
+            title="Select File for Custom Action — PC Control Hub",
             filetypes=[
-                ("Executables & Scripts", "*.exe *.bat *.cmd *.ps1"),
+                ("Executables & Shortcuts", "*.exe *.bat *.cmd *.ps1 *.lnk"),
                 ("All Files", "*.*"),
             ],
             parent=root,
