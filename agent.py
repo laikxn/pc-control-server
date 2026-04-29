@@ -345,122 +345,106 @@ def is_session_locked() -> bool:
         return False
 
 def get_volume_sessions() -> list:
-    """Return all active audio sessions with name, volume, muted state."""
+    """Return all active audio sessions. Called via run_in_executor (already in a thread)."""
     if not PYCAW_AVAILABLE:
         return []
     sessions_out = []
-    seen_names = set()
+    seen_names   = set()
     try:
-        from pycaw.pycaw import AudioUtilities
+        import pythoncom
+        pythoncom.CoInitialize()
         sessions = AudioUtilities.GetAllSessions()
         for s in sessions:
             try:
                 vol_iface = s._ctl.QueryInterface(ISimpleAudioVolume)
                 volume    = round(vol_iface.GetMasterVolume() * 100)
                 muted     = bool(vol_iface.GetMute())
-
                 if s.Process:
-                    # Try to get a friendly name from the process
                     proc_name = s.Process.name()
-                    # Remove .exe and clean up
-                    name = proc_name.replace(".exe", "").replace(".EXE", "")
-                    # Map common process names to friendly names
+                    name = proc_name.replace(".exe","").replace(".EXE","")
                     friendly = {
-                        "chrome":        "Google Chrome",
-                        "firefox":        "Firefox",
-                        "msedge":         "Microsoft Edge",
-                        "opera":          "Opera",
-                        "brave":          "Brave",
-                        "spotify":        "Spotify",
-                        "discord":        "Discord",
-                        "steam":          "Steam",
-                        "vlc":            "VLC",
-                        "mpc-hc64":       "MPC-HC",
-                        "mpc-hc":         "MPC-HC",
-                        "wmplayer":       "Windows Media Player",
-                        "groove":         "Groove Music",
-                        "zoom":           "Zoom",
-                        "teams":          "Microsoft Teams",
-                        "slack":          "Slack",
-                        "obs64":          "OBS Studio",
-                        "obs32":          "OBS Studio",
+                        "chrome":"Google Chrome","firefox":"Firefox","msedge":"Microsoft Edge",
+                        "opera":"Opera","brave":"Brave","spotify":"Spotify","discord":"Discord",
+                        "steam":"Steam","vlc":"VLC","mpc-hc64":"MPC-HC","mpc-hc":"MPC-HC",
+                        "wmplayer":"Windows Media Player","groove":"Groove Music",
+                        "zoom":"Zoom","teams":"Microsoft Teams","slack":"Slack",
+                        "obs64":"OBS Studio","obs32":"OBS Studio",
                     }
                     display_name = friendly.get(name.lower(), name)
                     pid = str(s.ProcessId)
                 else:
-                    display_name = "System Sounds"
-                    pid = "0"
-
-                # Skip duplicates (same app can have multiple sessions)
+                    # Skip system sounds here — they're shown as master volume
+                    continue
                 key = display_name.lower()
                 if key in seen_names:
                     continue
                 seen_names.add(key)
-
-                sessions_out.append({
-                    "id":     pid,
-                    "name":   display_name,
-                    "volume": volume,
-                    "muted":  muted,
-                })
+                sessions_out.append({"id":pid,"name":display_name,"volume":volume,"muted":muted})
             except:
                 pass
     except Exception as e:
-        print(f"[VOLUME] Error reading sessions: {e}")
+        print(f"[VOLUME] Sessions error: {e}")
+    finally:
+        try:
+            import pythoncom
+            pythoncom.CoUninitialize()
+        except: pass
     return sessions_out
 
 def get_master_volume() -> dict:
-    """Return master volume level and mute state. Runs in a COM-initialized thread."""
+    """Return master volume level and mute state. Called via run_in_executor (already in a thread)."""
     if not PYCAW_AVAILABLE:
         return {"volume": 50, "muted": False}
-    result = [{"volume": 50, "muted": False}]
-    def _run():
+    try:
+        import pythoncom
+        pythoncom.CoInitialize()
+        devices  = AudioUtilities.GetSpeakers()
+        iface    = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        endpoint = iface.QueryInterface(IAudioEndpointVolume)
+        volume   = round(endpoint.GetMasterVolumeLevelScalar() * 100)
+        muted    = bool(endpoint.GetMute())
+        return {"volume": volume, "muted": muted}
+    except Exception as e:
+        print(f"[VOLUME] Master volume error: {e}")
+        return {"volume": 50, "muted": False}
+    finally:
         try:
             import pythoncom
-            pythoncom.CoInitialize()
-            devices  = AudioUtilities.GetSpeakers()
-            iface    = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-            endpoint = iface.QueryInterface(IAudioEndpointVolume)
-            volume   = round(endpoint.GetMasterVolumeLevelScalar() * 100)
-            muted    = bool(endpoint.GetMute())
-            result[0] = {"volume": volume, "muted": muted}
-        except Exception as e:
-            print(f"[VOLUME] Master volume error: {e}")
-        finally:
-            try:
-                import pythoncom
-                pythoncom.CoUninitialize()
-            except: pass
-    t = threading.Thread(target=_run)
-    t.start(); t.join(timeout=3)
-    return result[0]
+            pythoncom.CoUninitialize()
+        except: pass
 
 def set_master_volume(volume: float, muted: bool | None = None) -> bool:
-    """Set the master volume level. Runs in a COM-initialized thread."""
+    """Set the master volume level. Called via run_in_executor (already in a thread)."""
     if not PYCAW_AVAILABLE:
+        print("[VOLUME] pycaw not available")
         return False
-    result = [False]
-    def _run():
+    try:
+        import pythoncom
+        print(f"[VOLUME] set_master_volume called: volume={volume}, muted={muted}")
+        pythoncom.CoInitialize()
+        print("[VOLUME] CoInitialize OK")
+        devices  = AudioUtilities.GetSpeakers()
+        print(f"[VOLUME] GetSpeakers OK: {devices}")
+        iface    = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        print("[VOLUME] Activate OK")
+        endpoint = iface.QueryInterface(IAudioEndpointVolume)
+        print("[VOLUME] QueryInterface OK")
+        scalar = max(0.0, min(1.0, volume / 100))
+        endpoint.SetMasterVolumeLevelScalar(scalar, None)
+        print(f"[VOLUME] SetMasterVolumeLevelScalar({scalar}) OK")
+        if muted is not None:
+            endpoint.SetMute(int(muted), None)
+            print(f"[VOLUME] SetMute({muted}) OK")
+        return True
+    except Exception as e:
+        print(f"[VOLUME] Set master error: {type(e).__name__}: {e}")
+        import traceback; traceback.print_exc()
+        return False
+    finally:
         try:
             import pythoncom
-            pythoncom.CoInitialize()
-            devices  = AudioUtilities.GetSpeakers()
-            iface    = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-            endpoint = iface.QueryInterface(IAudioEndpointVolume)
-            endpoint.SetMasterVolumeLevelScalar(max(0.0, min(1.0, volume / 100)), None)
-            if muted is not None:
-                endpoint.SetMute(int(muted), None)
-            result[0] = True
-        except Exception as e:
-            print(f"[VOLUME] Set master error: {e}")
-        finally:
-            try:
-                import pythoncom
-                pythoncom.CoUninitialize()
-            except: pass
-    t = threading.Thread(target=_run)
-    t.start(); t.join(timeout=3)
-    return result[0]
+            pythoncom.CoUninitialize()
+        except: pass
     """Set volume/mute for an audio session by process ID."""
     if not PYCAW_AVAILABLE:
         return False
@@ -484,6 +468,35 @@ def set_master_volume(volume: float, muted: bool | None = None) -> bool:
     return False
 
 def set_session_volume(pid: str, volume: float, muted: bool | None = None) -> bool:
+    """Set volume/mute for an audio session. Called via run_in_executor (already in a thread)."""
+    if not PYCAW_AVAILABLE:
+        return False
+    try:
+        import pythoncom
+        pythoncom.CoInitialize()
+        sessions = AudioUtilities.GetAllSessions()
+        changed  = False
+        for s in sessions:
+            if str(s.ProcessId) == str(pid) or (pid == "0" and not s.Process):
+                try:
+                    vol_iface = s._ctl.QueryInterface(ISimpleAudioVolume)
+                    vol_iface.SetMasterVolume(max(0.0, min(1.0, volume / 100)), None)
+                    if muted is not None:
+                        vol_iface.SetMute(int(muted), None)
+                    changed = True
+                except:
+                    pass
+        return changed
+    except Exception as e:
+        print(f"[VOLUME] Set session error: {e}")
+        return False
+    finally:
+        try:
+            import pythoncom
+            pythoncom.CoUninitialize()
+        except: pass
+
+def wake_on_lan(mac: str) -> bool:
     try:
         mac_bytes = bytes.fromhex(mac.replace(":", "").replace("-", ""))
         packet    = b"\xff" * 6 + mac_bytes * 16
@@ -678,6 +691,26 @@ async def send_stats_loop(ws):
             print("[STATS ERROR]", e); break
         await asyncio.sleep(STATS_INTERVAL)
 
+async def send_volume_loop(ws):
+    """Push volume data every 3 seconds so the app stays in sync with PC-side changes."""
+    if not PYCAW_AVAILABLE:
+        return
+    await asyncio.sleep(2)  # slight delay on startup
+    while True:
+        try:
+            loop   = asyncio.get_event_loop()
+            master   = await loop.run_in_executor(None, get_master_volume)
+            sessions = await loop.run_in_executor(None, get_volume_sessions)
+            await ws.send(json.dumps({
+                "type":     "volume_data",
+                "device_id": DEVICE_ID,
+                "master":   master,
+                "sessions": sessions,
+            }))
+        except Exception as e:
+            print("[VOLUME LOOP ERROR]", e); break
+        await asyncio.sleep(3)
+
 async def handle_command(cmd, ws):
     t      = cmd.get("type")
     cmd_id = cmd.get("command_id")
@@ -709,9 +742,10 @@ async def handle_command(cmd, ws):
             flags["file_picker_request"] = {"request_id": request_id}
             return
         elif t == "get_volume":
-            # Return current master + all session volumes
-            master   = get_master_volume()
-            sessions = get_volume_sessions()
+            # Run blocking COM calls in executor so we don't block the event loop
+            loop = asyncio.get_event_loop()
+            master   = await loop.run_in_executor(None, get_master_volume)
+            sessions = await loop.run_in_executor(None, get_volume_sessions)
             await ws.send(json.dumps({
                 "type":     "volume_data",
                 "device_id": DEVICE_ID,
@@ -723,7 +757,9 @@ async def handle_command(cmd, ws):
             vol   = cmd.get("volume")
             muted = cmd.get("muted")
             if vol is not None:
-                if not set_master_volume(float(vol), muted): status = "failed"
+                loop = asyncio.get_event_loop()
+                ok = await loop.run_in_executor(None, lambda: set_master_volume(float(vol), muted))
+                if not ok: status = "failed"
             else:
                 status = "failed"
         elif t == "set_session_volume":
@@ -731,7 +767,9 @@ async def handle_command(cmd, ws):
             vol   = cmd.get("volume")
             muted = cmd.get("muted")
             if pid is not None and vol is not None:
-                if not set_session_volume(str(pid), float(vol), muted): status = "failed"
+                loop = asyncio.get_event_loop()
+                ok = await loop.run_in_executor(None, lambda: set_session_volume(str(pid), float(vol), muted))
+                if not ok: status = "failed"
             else:
                 status = "failed"
         elif t == "save_startup_queue":
@@ -788,6 +826,7 @@ async def connect():
 
                 heartbeat_task = asyncio.create_task(send_heartbeat(ws))
                 stats_task     = asyncio.create_task(send_stats_loop(ws))
+                volume_task    = asyncio.create_task(send_volume_loop(ws))
 
                 while True:
                     try:
@@ -796,7 +835,7 @@ async def connect():
                         await handle_command(data, ws)
                     except websockets.ConnectionClosed:
                         print("[DISCONNECTED] reconnecting...")
-                        heartbeat_task.cancel(); stats_task.cancel(); break
+                        heartbeat_task.cancel(); stats_task.cancel(); volume_task.cancel(); break
                     except Exception as e:
                         print("[RECV ERROR]", e)
         except Exception as e:

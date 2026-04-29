@@ -582,13 +582,10 @@ async def handler(ws):
             # ── VOLUME DATA FROM AGENT → MOBILE ──
             elif msg_type == "volume_data":
                 dev_id = data.get("device_id")
-                if dev_id and dev_id in pending_volume_requests:
-                    origin_ws = pending_volume_requests.pop(dev_id)
-                    try:    await origin_ws.send(json.dumps(data))
-                    except: pass
-                else:
-                    # Broadcast to all mobile clients if no pending request
-                    await broadcast_to_mobile(data)
+                # Always broadcast to all mobile clients so app stays in sync
+                await broadcast_to_mobile(data)
+                # Also clear any pending one-shot request
+                pending_volume_requests.pop(dev_id, None)
 
     except Exception as e:
         print("[WS ERROR]", e)
