@@ -349,20 +349,57 @@ def get_volume_sessions() -> list:
     if not PYCAW_AVAILABLE:
         return []
     sessions_out = []
+    seen_names = set()
     try:
+        from pycaw.pycaw import AudioUtilities
         sessions = AudioUtilities.GetAllSessions()
         for s in sessions:
             try:
                 vol_iface = s._ctl.QueryInterface(ISimpleAudioVolume)
                 volume    = round(vol_iface.GetMasterVolume() * 100)
                 muted     = bool(vol_iface.GetMute())
+
                 if s.Process:
-                    name = s.Process.name().replace(".exe", "")
+                    # Try to get a friendly name from the process
+                    proc_name = s.Process.name()
+                    # Remove .exe and clean up
+                    name = proc_name.replace(".exe", "").replace(".EXE", "")
+                    # Map common process names to friendly names
+                    friendly = {
+                        "chrome":        "Google Chrome",
+                        "firefox":        "Firefox",
+                        "msedge":         "Microsoft Edge",
+                        "opera":          "Opera",
+                        "brave":          "Brave",
+                        "spotify":        "Spotify",
+                        "discord":        "Discord",
+                        "steam":          "Steam",
+                        "vlc":            "VLC",
+                        "mpc-hc64":       "MPC-HC",
+                        "mpc-hc":         "MPC-HC",
+                        "wmplayer":       "Windows Media Player",
+                        "groove":         "Groove Music",
+                        "zoom":           "Zoom",
+                        "teams":          "Microsoft Teams",
+                        "slack":          "Slack",
+                        "obs64":          "OBS Studio",
+                        "obs32":          "OBS Studio",
+                    }
+                    display_name = friendly.get(name.lower(), name)
+                    pid = str(s.ProcessId)
                 else:
-                    name = "System"
+                    display_name = "System Sounds"
+                    pid = "0"
+
+                # Skip duplicates (same app can have multiple sessions)
+                key = display_name.lower()
+                if key in seen_names:
+                    continue
+                seen_names.add(key)
+
                 sessions_out.append({
-                    "id":     str(s.ProcessId),
-                    "name":   name,
+                    "id":     pid,
+                    "name":   display_name,
                     "volume": volume,
                     "muted":  muted,
                 })
@@ -394,13 +431,19 @@ def set_session_volume(pid: str, volume: float, muted: bool | None = None) -> bo
         return False
     try:
         sessions = AudioUtilities.GetAllSessions()
+        changed = False
         for s in sessions:
-            if str(s.ProcessId) == str(pid):
-                vol_iface = s._ctl.QueryInterface(ISimpleAudioVolume)
-                vol_iface.SetMasterVolume(max(0.0, min(1.0, volume / 100)), None)
-                if muted is not None:
-                    vol_iface.SetMute(int(muted), None)
-                return True
+            # Match by PID, or match all system sessions if pid == "0"
+            if str(s.ProcessId) == str(pid) or (pid == "0" and not s.Process):
+                try:
+                    vol_iface = s._ctl.QueryInterface(ISimpleAudioVolume)
+                    vol_iface.SetMasterVolume(max(0.0, min(1.0, volume / 100)), None)
+                    if muted is not None:
+                        vol_iface.SetMute(int(muted), None)
+                    changed = True
+                except:
+                    pass
+        return changed
     except Exception as e:
         print(f"[VOLUME] Set session error: {e}")
     return False
