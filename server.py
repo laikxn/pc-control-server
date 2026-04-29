@@ -39,6 +39,10 @@ scheduled_events = {}
 # Flushed to mobile on next register_mobile
 queued_notifications = {}
 
+# UTC offset in seconds sent by mobile on register, used for event scheduling
+# e.g. EST = -18000, CDT = -14400
+mobile_utc_offset = 0
+
 IDLE_THRESHOLD    = 10
 OFFLINE_THRESHOLD = 25
 PAIR_CODE_TTL     = 120
@@ -225,7 +229,9 @@ def should_event_fire(event: dict, now_ts: float) -> bool:
     if not event.get("enabled", True):
         return False
     import datetime
-    now_dt   = datetime.datetime.fromtimestamp(now_ts)
+    # Apply mobile's UTC offset so we compare against user's local time, not server time
+    local_ts = now_ts + mobile_utc_offset
+    now_dt   = datetime.datetime.utcfromtimestamp(local_ts)
     e_hour   = event.get("hour",   -1)
     e_minute = event.get("minute", -1)
     if now_dt.hour != e_hour or now_dt.minute != e_minute:
@@ -314,25 +320,26 @@ async def scheduler_loop():
     import datetime
     while True:
         await asyncio.sleep(20)
-        now_ts = time.time()
-        now_dt = datetime.datetime.fromtimestamp(now_ts)
-        total  = sum(len(v) for v in scheduled_events.values())
-        print(f"[SCHEDULER] {now_dt.strftime('%H:%M:%S')} (local) — {total} event(s) loaded")
+        now_ts   = time.time()
+        now_dt   = datetime.datetime.fromtimestamp(now_ts)
+        local_dt = datetime.datetime.utcfromtimestamp(now_ts + mobile_utc_offset)
+        total    = sum(len(v) for v in scheduled_events.values())
+        print(f"[SCHEDULER] server={now_dt.strftime('%H:%M:%S')} user={local_dt.strftime('%H:%M:%S')} offset={mobile_utc_offset//3600:+d}h — {total} event(s)")
         for device_id, events in list(scheduled_events.items()):
             for event in events:
                 name      = event.get("name", "?")
-                enabled   = event.get("enabled", True)
-                fired     = event.get("fired", False)
                 e_hour    = event.get("hour", -1)
                 e_minute  = event.get("minute", -1)
+                enabled   = event.get("enabled", True)
+                fired     = event.get("fired", False)
                 recur     = event.get("recurrence", "once")
                 last_fired= event.get("last_fired", 0)
-                print(f"  event='{name}' target={e_hour:02d}:{e_minute:02d} "
-                      f"now={now_dt.hour:02d}:{now_dt.minute:02d} "
+                print(f"  '{name}' target={e_hour:02d}:{e_minute:02d} "
+                      f"user_now={local_dt.hour:02d}:{local_dt.minute:02d} "
                       f"enabled={enabled} fired={fired} recur={recur} "
                       f"last_fired_ago={int(now_ts-last_fired)}s")
                 if should_event_fire(event, now_ts):
-                    print(f"  >>> FIRING '{name}'")
+                    print(f"  >>> FIRING '{name}' for {device_id}")
                     event["last_fired"] = now_ts
                     if recur == "once":
                         event["fired"]   = True
@@ -349,9 +356,10 @@ async def handler(ws):
 
     try:
         async for msg in ws:
-            print("[RAW]", msg[:120])
             data     = json.loads(msg)
             msg_type = data.get("type")
+            if msg_type not in ("heartbeat", "pc_stats"):
+                print("[RAW]", msg[:120])
             await send_log("MESSAGE_RECEIVED", {"type": msg_type})
 
             # ── PC REGISTRATION ──
@@ -410,9 +418,17 @@ async def handler(ws):
 
             # ── MOBILE REGISTRATION ──
             elif msg_type == "register_mobile":
+                global mobile_utc_offset
                 client_type = "mobile"
                 mobile_clients.add(ws)
-                print("[MOBILE CONNECTED]")
+                utc_offset = data.get("utc_offset_seconds")
+                if utc_offset is not None:
+                    mobile_utc_offset = int(utc_offset)
+                    import datetime
+                    local_dt = datetime.datetime.utcfromtimestamp(time.time() + mobile_utc_offset)
+                    print(f"[MOBILE CONNECTED] UTC offset={mobile_utc_offset//3600:+d}h, user time={local_dt.strftime('%H:%M:%S')}")
+                else:
+                    print("[MOBILE CONNECTED] (no UTC offset sent — events may fire at wrong time)")
                 for dev_id, status in device_status.items():
                     try:
                         await ws.send(json.dumps({

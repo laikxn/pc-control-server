@@ -316,27 +316,134 @@ def wake_on_lan(mac: str) -> bool:
         print("[WOL ERROR]", e)
         return False
 
+def find_steam_appid_for_path(exe_path: str):
+    """
+    Given a path inside steamapps/common/, try to find the Steam App ID
+    by scanning the steamapps folder for .acf manifest files.
+    Returns the appid string if found, else None.
+    """
+    try:
+        import re
+        path_lower = exe_path.replace("\\", "/").lower()
+        # Extract game folder name from path (the folder directly under steamapps/common/)
+        match = re.search(r"steamapps/common/([^/]+)", path_lower)
+        if not match:
+            return None
+        game_folder = match.group(1)
+
+        # Find steamapps directory
+        steamapps_dir = re.search(r"(.+steamapps)/common/", exe_path.replace("\\", "/"), re.IGNORECASE)
+        if not steamapps_dir:
+            return None
+        acf_dir = steamapps_dir.group(1)
+
+        # Scan .acf manifest files for matching installdir
+        import glob
+        for acf_file in glob.glob(os.path.join(acf_dir, "appmanifest_*.acf")):
+            try:
+                with open(acf_file, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+                installdir_match = re.search(r'"installdir"\s+"([^"]+)"', content)
+                appid_match      = re.search(r'"appid"\s+"(\d+)"', content)
+                if installdir_match and appid_match:
+                    if installdir_match.group(1).lower() == game_folder:
+                        return appid_match.group(1)
+            except: pass
+    except Exception as e:
+        print(f"[STEAM DETECT] Error: {e}")
+    return None
+
+def find_epic_appid_for_path(exe_path: str):
+    """
+    Try to find the Epic Games launch ID for a given exe path by reading
+    Epic's LauncherInstalled.dat file.
+    Returns a launch URI string like com.epicgames.launcher://apps/APPNAME?action=launch
+    """
+    try:
+        import re, json as _json
+        dat_path = os.path.join(
+            os.environ.get("PROGRAMDATA", "C:\\ProgramData"),
+            "Epic", "UnrealEngineLauncher", "LauncherInstalled.dat"
+        )
+        if not os.path.exists(dat_path):
+            return None
+        with open(dat_path, "r", encoding="utf-8", errors="ignore") as f:
+            data = _json.load(f)
+        exe_norm = exe_path.replace("\\", "/").lower()
+        for entry in data.get("InstallationList", []):
+            install_dir = entry.get("InstallLocation", "").replace("\\", "/").lower()
+            if install_dir and exe_norm.startswith(install_dir):
+                app_name = entry.get("AppName", "")
+                if app_name:
+                    return f"com.epicgames.launcher://apps/{app_name}?action=launch&silent=true"
+    except Exception as e:
+        print(f"[EPIC DETECT] Error: {e}")
+    return None
+
 def run_file(path: str) -> bool:
-    """Run an exe, script, steam:// URL, or open any file with its default handler.
+    """
+    Run an exe, script, steam:// URL, or any file with its default handler.
 
-    For Steam games, users can provide:
-      - steam://rungameid/730          (CS2 example — launches via Steam properly)
-      - A normal .exe path             (launched directly, may not work for Steam games)
+    Auto-detects:
+      - Steam games (steamapps/common/...): looks up App ID from .acf manifests,
+        launches via steam://rungameid/APPID
+      - Epic Games (Epic/... install dir): looks up app name from LauncherInstalled.dat,
+        launches via Epic launcher URI
+      - .lnk / .url shortcuts: launched directly via os.startfile (works for Steam,
+        Epic, Xbox shortcuts created via right-click > Create Shortcut)
+      - Manual steam://rungameid/APPID paths: passed through directly
 
-    Using the steam:// protocol is the recommended way to launch Steam games
-    because it ensures Steam loads all required overlays and dependencies.
+    Tip: For any game launcher, creating a desktop shortcut and using the .lnk path
+    is the most reliable method if auto-detection doesn't work.
     """
     print(f"[ACTION] Run: {path}")
     try:
+        path_lower = path.lower().replace("\\", "/")
+
+        # Already a protocol URL — pass through directly
+        if any(path_lower.startswith(p) for p in ("steam://", "com.epicgames", "xbox://", "http://", "https://")):
+            if os.name == "nt":
+                os.startfile(path)
+            else:
+                import subprocess
+                subprocess.Popen(["xdg-open", path])
+            return True
+
+        # .lnk or .url shortcut — launch directly, Windows resolves the target
+        if path_lower.endswith(".lnk") or path_lower.endswith(".url"):
+            print(f"[ACTION] Launching shortcut: {path}")
+            os.startfile(path)
+            return True
+
+        # Auto-detect Steam games
+        if "steamapps" in path_lower and "common" in path_lower:
+            appid = find_steam_appid_for_path(path)
+            if appid:
+                steam_url = f"steam://rungameid/{appid}"
+                print(f"[ACTION] Steam game detected — launching via {steam_url}")
+                os.startfile(steam_url) if os.name == "nt" else __import__("subprocess").Popen(["xdg-open", steam_url])
+                return True
+            else:
+                print(f"[ACTION] Steam path detected but App ID not found — trying direct launch")
+
+        # Auto-detect Epic Games
         if os.name == "nt":
-            # steam:// and other protocol URLs work fine with os.startfile on Windows
+            epic_dirs = ["epic games", "epicgames", "fortnite", "unrealengine"]
+            if any(d in path_lower for d in epic_dirs):
+                epic_uri = find_epic_appid_for_path(path)
+                if epic_uri:
+                    print(f"[ACTION] Epic game detected — launching via {epic_uri}")
+                    os.startfile(epic_uri)
+                    return True
+                else:
+                    print(f"[ACTION] Epic path detected but app not found — trying direct launch")
+
+        # Default: launch directly
+        if os.name == "nt":
             os.startfile(path)
         else:
             import subprocess
-            if path.startswith("steam://") or path.startswith("http://") or path.startswith("https://"):
-                subprocess.Popen(["xdg-open", path])
-            else:
-                subprocess.Popen(["xdg-open", path])
+            subprocess.Popen(["xdg-open", path])
         return True
     except Exception as e:
         print(f"[RUN FILE ERROR] {e}")
