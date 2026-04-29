@@ -668,33 +668,100 @@ def handle_file_picker_request(request_id: str):
 # ─────────────────────────────────────────────
 # Custom topmost dialog
 # ─────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# Design tokens — matches mobile app aesthetic
+# ─────────────────────────────────────────────
+UI = {
+    "bg":           "#0b0f14",   # deep dark background
+    "surface":      "#1c2130",   # card/surface background
+    "surface2":     "#263044",   # slightly lighter surface
+    "border":       "#2a3248",   # subtle border
+    "accent":       "#007aff",   # iOS blue
+    "accent_green": "#22c55e",   # online / success green
+    "accent_red":   "#ef4444",   # destructive / error
+    "accent_amber": "#f59e0b",   # warning
+    "text":         "#ffffff",   # primary text
+    "text_sub":     "#8e9bb5",   # secondary text
+    "text_muted":   "#4a5568",   # muted text / code
+    "code_bg":      "#141923",   # code block background
+    "code_fg":      "#64d9ff",   # code text (cyan)
+    "btn_primary":  "#007aff",
+    "btn_danger":   "#ef4444",
+    "btn_neutral":  "#263044",
+    "radius":       8,
+}
+
+def _center(win, w, h):
+    sw = win.winfo_screenwidth(); sh = win.winfo_screenheight()
+    win.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
+
+def _font(size=10, weight="normal", family="Segoe UI"):
+    return tkfont.Font(family=family, size=size, weight=weight)
+
+def _styled_button(parent, text, bg, fg="#ffffff", command=None, width=None):
+    """A flat, rounded-look button matching the mobile aesthetic."""
+    kw = dict(
+        text=text, font=_font(10, "bold"), bg=bg, fg=fg,
+        relief="flat", bd=0, padx=20, pady=8,
+        activebackground=bg, activeforeground=fg,
+        cursor="hand2",
+    )
+    if width: kw["width"] = width
+    if command: kw["command"] = command
+    btn = tk.Button(parent, **kw)
+    return btn
+
 def _topmost_dialog(title: str, message: str, kind: str = "yesno", extra_button: str | None = None):
     result = [None]
     dlg = tk.Tk()
-    dlg.title(title); dlg.configure(bg="#1a1a2e"); dlg.resizable(False, False)
-    dlg.attributes("-topmost", True); dlg.lift(); dlg.focus_force()
-    w = 400; h = 170 if kind == "info" else 200
-    sw = dlg.winfo_screenwidth(); sh = dlg.winfo_screenheight()
-    dlg.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
-    body_font = tkfont.Font(family="Segoe UI", size=10)
-    btn_font  = tkfont.Font(family="Segoe UI", size=10, weight="bold")
-    tk.Label(dlg, text=message, font=body_font, bg="#1a1a2e", fg="#cccccc",
-             wraplength=360, justify="center").pack(pady=(24,16), padx=20)
-    btn_frame = tk.Frame(dlg, bg="#1a1a2e"); btn_frame.pack(pady=(0,16))
-    if kind == "yesno":
+    dlg.title("PC Control Hub")
+    dlg.configure(bg=UI["bg"])
+    dlg.resizable(False, False)
+    dlg.attributes("-topmost", True)
+    dlg.lift(); dlg.focus_force()
+
+    is_info   = kind == "info"
+    is_triple = kind == "triple"
+    h = 160 if is_info else 190 if not is_triple else 210
+    _center(dlg, 420, h)
+
+    # Title bar accent line
+    tk.Frame(dlg, bg=UI["accent"], height=3).pack(fill="x")
+
+    # Title label
+    tk.Label(dlg, text=title, font=_font(12, "bold"),
+             bg=UI["bg"], fg=UI["text"], anchor="w",
+             padx=24, pady=12).pack(fill="x")
+
+    # Divider
+    tk.Frame(dlg, bg=UI["border"], height=1).pack(fill="x", padx=0)
+
+    # Message
+    tk.Label(dlg, text=message, font=_font(10),
+             bg=UI["bg"], fg=UI["text_sub"],
+             wraplength=372, justify="left",
+             padx=24, pady=16, anchor="w").pack(fill="x")
+
+    # Buttons
+    btn_frame = tk.Frame(dlg, bg=UI["bg"], padx=20, pady=0)
+    btn_frame.pack(fill="x")
+
+    if is_info:
+        _styled_button(btn_frame, "OK", UI["btn_primary"],
+                       command=dlg.destroy).pack(side="right", padx=(6,0))
+    elif kind == "yesno":
         def on_yes(): result[0]=True;  dlg.destroy()
         def on_no():  result[0]=False; dlg.destroy()
-        tk.Button(btn_frame, text="Yes", font=btn_font, bg="#22c55e", fg="white", relief="flat", padx=22, pady=6, command=on_yes).pack(side="left", padx=8)
-        tk.Button(btn_frame, text="No",  font=btn_font, bg="#333355", fg="white", relief="flat", padx=22, pady=6, command=on_no).pack(side="left",  padx=8)
-    elif kind == "triple":
+        _styled_button(btn_frame, "Yes", UI["btn_primary"], command=on_yes).pack(side="right", padx=(6,0))
+        _styled_button(btn_frame, "No",  UI["btn_neutral"], command=on_no).pack(side="right",  padx=(6,0))
+    elif is_triple:
         def on_yes():   result[0]="yes";   dlg.destroy()
         def on_extra(): result[0]="extra"; dlg.destroy()
         def on_no():    result[0]="no";    dlg.destroy()
-        tk.Button(btn_frame, text="Yes",                   font=btn_font, bg="#22c55e", fg="white", relief="flat", padx=16, pady=6, command=on_yes).pack(side="left",   padx=6)
-        tk.Button(btn_frame, text=extra_button or "Other", font=btn_font, bg="#007aff", fg="white", relief="flat", padx=16, pady=6, command=on_extra).pack(side="left", padx=6)
-        tk.Button(btn_frame, text="No",                    font=btn_font, bg="#333355", fg="white", relief="flat", padx=16, pady=6, command=on_no).pack(side="left",    padx=6)
-    else:
-        tk.Button(btn_frame, text="OK", font=btn_font, bg="#007aff", fg="white", relief="flat", padx=28, pady=6, command=dlg.destroy).pack()
+        _styled_button(btn_frame, "Yes",                   UI["btn_primary"],  command=on_yes).pack(side="right",   padx=(6,0))
+        _styled_button(btn_frame, extra_button or "Other", UI["accent_green"], command=on_extra).pack(side="right", padx=(6,0))
+        _styled_button(btn_frame, "No",                    UI["btn_neutral"],  command=on_no).pack(side="right",    padx=(6,0))
+
     dlg.mainloop()
     return result[0]
 
@@ -730,40 +797,64 @@ def show_pair_popup():
     root = tk.Tk()
     popup_ref["root"] = root
     root.title("PC Control Hub — Pair Device")
-    root.configure(bg="#1a1a2e"); root.resizable(False, False)
-    root.attributes("-topmost", True); root.lift(); root.focus_force()
-    w = 340; h = 480 if QR_AVAILABLE else 280
-    sw = root.winfo_screenwidth(); sh = root.winfo_screenheight()
-    root.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
+    root.configure(bg=UI["bg"])
+    root.resizable(False, False)
+    root.attributes("-topmost", True)
+    root.lift(); root.focus_force()
 
-    title_font = tkfont.Font(family="Segoe UI",    size=13, weight="bold")
-    body_font  = tkfont.Font(family="Segoe UI",    size=10)
-    code_font  = tkfont.Font(family="Courier New", size=30, weight="bold")
-    small_font = tkfont.Font(family="Segoe UI",    size=8)
+    w = 360; h = 530 if QR_AVAILABLE else 320
+    _center(root, w, h)
 
-    tk.Label(root, text="PC Control Hub", font=title_font, bg="#1a1a2e", fg="#ffffff").pack(pady=(18,2))
-    tk.Label(root, text="Scan the QR code or enter the manual\ncode in the app to pair your phone.",
-             font=body_font, bg="#1a1a2e", fg="#aaaaaa", justify="center").pack(pady=(0,10))
+    # Top accent bar
+    tk.Frame(root, bg=UI["accent"], height=3).pack(fill="x")
+
+    # Header
+    hdr = tk.Frame(root, bg=UI["bg"])
+    hdr.pack(fill="x", padx=24, pady=(18, 0))
+    tk.Label(hdr, text="PC Control Hub", font=_font(15, "bold"),
+             bg=UI["bg"], fg=UI["text"]).pack(anchor="w")
+    tk.Label(hdr, text="Pair a new device", font=_font(10),
+             bg=UI["bg"], fg=UI["text_sub"]).pack(anchor="w", pady=(2,0))
+
+    # Divider
+    tk.Frame(root, bg=UI["border"], height=1).pack(fill="x", padx=24, pady=(12,0))
 
     if QR_AVAILABLE:
+        # Instructions
+        tk.Label(root, text="Scan QR code with the PC Control Hub app",
+                 font=_font(9), bg=UI["bg"], fg=UI["text_sub"]).pack(pady=(10,6))
+
+        # QR code — white card
         qr_data = json.dumps({"server": SERVER_URL, "code": code})
         qr = qrcode.QRCode(version=2, error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=6, border=3)
         qr.add_data(qr_data); qr.make(fit=True)
-        qr_img  = qr.make_image(fill_color="black", back_color="white")
+        qr_img  = qr.make_image(fill_color="#0b0f14", back_color="white")
         buf     = BytesIO(); qr_img.save(buf, format="PNG"); buf.seek(0)
-        pil_img = Image.open(buf).resize((200, 200), Image.NEAREST)
+        pil_img = Image.open(buf).resize((210, 210), Image.NEAREST)
         tk_img  = ImageTk.PhotoImage(pil_img)
-        qr_frame = tk.Frame(root, bg="white", padx=4, pady=4); qr_frame.pack(pady=(0,10))
-        tk.Label(qr_frame, image=tk_img, bg="white").pack()
+        qr_card = tk.Frame(root, bg="white", padx=6, pady=6, relief="flat")
+        qr_card.pack(pady=(0,12))
+        tk.Label(qr_card, image=tk_img, bg="white").pack()
         root._qr_img = tk_img
 
-    tk.Label(root, text="Manual Code", font=body_font, bg="#1a1a2e", fg="#aaaaaa").pack()
-    code_frame = tk.Frame(root, bg="#0f3460", padx=16, pady=10); code_frame.pack(pady=(4,8))
-    tk.Label(code_frame, text=f"{code[:3]} {code[3:]}", font=code_font, bg="#0f3460", fg="#e94560").pack()
+    # Divider with "or"
+    or_row = tk.Frame(root, bg=UI["bg"]); or_row.pack(fill="x", padx=24, pady=(0,8))
+    tk.Frame(or_row, bg=UI["border"], height=1).pack(side="left", fill="x", expand=True, pady=6)
+    tk.Label(or_row, text="  manual code  ", font=_font(8), bg=UI["bg"], fg=UI["text_muted"]).pack(side="left")
+    tk.Frame(or_row, bg=UI["border"], height=1).pack(side="left", fill="x", expand=True, pady=6)
 
+    # Code display
+    code_card = tk.Frame(root, bg=UI["surface"], padx=20, pady=12)
+    code_card.pack(padx=24, fill="x")
+    tk.Label(code_card, text=f"{code[:3]}  {code[3:]}", font=_font(28, "bold", "Courier New"),
+             bg=UI["surface"], fg=UI["code_fg"]).pack()
+
+    # Expiry + server info
     timer_var = tk.StringVar(value=f"Expires in {PAIR_CODE_TTL}s")
-    tk.Label(root, textvariable=timer_var, font=small_font, bg="#1a1a2e", fg="#666688").pack()
-    tk.Label(root, text=f"Server: {SERVER_URL}", font=small_font, bg="#1a1a2e", fg="#555577").pack(pady=(4,0))
+    tk.Label(root, textvariable=timer_var, font=_font(8),
+             bg=UI["bg"], fg=UI["text_muted"]).pack(pady=(6,0))
+    tk.Label(root, text=f"Server: {SERVER_URL}", font=_font(8),
+             bg=UI["bg"], fg=UI["text_muted"]).pack(pady=(2,10))
 
     remaining = [PAIR_CODE_TTL]
     def tick():
@@ -781,7 +872,7 @@ def show_pair_popup():
 def handle_show_qr():
     if is_paired():
         answer = _topmost_dialog(
-            "PC Control Hub — Already Paired",
+            "Already Paired",
             f"{DEVICE_NAME} is already paired to a phone.\n\nWould you like to unpair and pair with a new phone instead?",
             kind="triple", extra_button="Unpair & Repair"
         )
@@ -792,17 +883,21 @@ def handle_show_qr():
 
 def handle_unpaired_dialog():
     repair = _topmost_dialog(
-        "PC Control Hub — Device Unpaired",
+        "Device Unpaired",
         "Your phone has been disconnected from this PC.\n\nWould you like to pair with a new phone?",
         kind="yesno"
     )
     if repair:
         show_pair_popup()
     else:
-        uninstall = _topmost_dialog("PC Control Hub", "Would you like to uninstall PC Control Hub from this PC?", kind="yesno")
+        uninstall = _topmost_dialog(
+            "Uninstall PC Control Hub?",
+            "Would you like to uninstall PC Control Hub from this PC?",
+            kind="yesno"
+        )
         if uninstall:
             _topmost_dialog("PC Control Hub",
-                "Thank you for using PC Control Hub!\n\nThe application will now close.\nYou can uninstall it from Windows Settings → Apps.",
+                "The application will now close.\nYou can uninstall it from Windows Settings → Apps.",
                 kind="info")
             sys.exit(0)
         else:
@@ -810,12 +905,14 @@ def handle_unpaired_dialog():
 
 def handle_tray_unpair():
     if not is_paired():
-        _topmost_dialog("PC Control Hub", "This PC is not currently paired to any phone.", kind="info"); return
+        _topmost_dialog("Not Paired", "This PC is not currently paired to any phone.", kind="info"); return
     result = _topmost_dialog("Unpair Device",
-        f"This will disconnect your phone from {DEVICE_NAME}.\n\nAre you sure you want to unpair?", kind="yesno")
+        f"This will disconnect your phone from {DEVICE_NAME}.\n\nAre you sure you want to unpair?",
+        kind="yesno")
     if not result: return
     _do_unpair_and_notify()
-    again = _topmost_dialog("Pair New Device?", "Would you like to pair this PC with a new phone?", kind="yesno")
+    again = _topmost_dialog("Pair New Device?",
+        "Would you like to pair this PC with a new phone?", kind="yesno")
     if again: show_pair_popup()
 
 def handle_tray_restart():
