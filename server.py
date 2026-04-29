@@ -225,13 +225,12 @@ def should_event_fire(event: dict, now_ts: float) -> bool:
     if not event.get("enabled", True):
         return False
     import datetime
-    now_dt  = datetime.datetime.fromtimestamp(now_ts)
+    now_dt   = datetime.datetime.fromtimestamp(now_ts)
     e_hour   = event.get("hour",   -1)
     e_minute = event.get("minute", -1)
     if now_dt.hour != e_hour or now_dt.minute != e_minute:
         return False
     recurrence = event.get("recurrence", "once")
-    # Debounce: don't fire again within the same minute window
     last_fired = event.get("last_fired", 0)
     if now_ts - last_fired < 59:
         return False
@@ -312,18 +311,30 @@ async def execute_scheduled_event(device_id: str, event: dict):
 
 async def scheduler_loop():
     """Checks all scheduled events every 20 seconds."""
+    import datetime
     while True:
         await asyncio.sleep(20)
         now_ts = time.time()
-        import datetime
         now_dt = datetime.datetime.fromtimestamp(now_ts)
-        print(f"[SCHEDULER] Tick {now_dt.strftime('%H:%M:%S')} — {sum(len(v) for v in scheduled_events.values())} event(s)")
+        total  = sum(len(v) for v in scheduled_events.values())
+        print(f"[SCHEDULER] {now_dt.strftime('%H:%M:%S')} (local) — {total} event(s) loaded")
         for device_id, events in list(scheduled_events.items()):
             for event in events:
+                name      = event.get("name", "?")
+                enabled   = event.get("enabled", True)
+                fired     = event.get("fired", False)
+                e_hour    = event.get("hour", -1)
+                e_minute  = event.get("minute", -1)
+                recur     = event.get("recurrence", "once")
+                last_fired= event.get("last_fired", 0)
+                print(f"  event='{name}' target={e_hour:02d}:{e_minute:02d} "
+                      f"now={now_dt.hour:02d}:{now_dt.minute:02d} "
+                      f"enabled={enabled} fired={fired} recur={recur} "
+                      f"last_fired_ago={int(now_ts-last_fired)}s")
                 if should_event_fire(event, now_ts):
-                    print(f"[SCHEDULER] Firing '{event.get('name')}' for {device_id}")
+                    print(f"  >>> FIRING '{name}'")
                     event["last_fired"] = now_ts
-                    if event.get("recurrence", "once") == "once":
+                    if recur == "once":
                         event["fired"]   = True
                         event["enabled"] = False
                     save_events()
@@ -575,9 +586,12 @@ async def scheduler_loop():
         await asyncio.sleep(60)
 
 async def main():
+    import datetime
     load_tokens()
     load_events()
-    print("[SERVER STARTED] ws://0.0.0.0:8000")
+    now = datetime.datetime.now()
+    print(f"[SERVER STARTED] ws://0.0.0.0:8000")
+    print(f"[SERVER TIME]    {now.strftime('%Y-%m-%d %H:%M:%S')} (local) — if this doesn't match your phone's time, set TZ env var")
     async with websockets.serve(handler, "0.0.0.0", 8000):
         asyncio.create_task(state_monitor())
         asyncio.create_task(scheduler_loop())
