@@ -926,9 +926,28 @@ def tray_on_restart(icon, item): flags["tray_restart"]= True
 def tray_on_quit(icon, item):    flags["tray_quit"]   = True
 
 def make_tray_image():
+    """Load the PCLink icon for the system tray, fall back to a blue dot."""
+    # Check PyInstaller bundle temp dir first, then exe/script directory
+    search_dirs = []
+    if getattr(sys, "frozen", False):
+        search_dirs.append(sys._MEIPASS)                          # bundled data files
+        search_dirs.append(os.path.dirname(sys.executable))      # next to exe
+    else:
+        search_dirs.append(os.path.dirname(os.path.abspath(__file__)))  # next to script
+
+    for base_dir in search_dirs:
+        for name in ("icon.ico", "icon.png", "pclink-icon.png"):
+            path = os.path.join(base_dir, name)
+            if os.path.exists(path):
+                try:
+                    img = Image.open(path).convert("RGBA").resize((64, 64), Image.LANCZOS)
+                    return img
+                except: pass
+
+    # Fallback — blue dot matching app accent color
     img  = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    draw.ellipse([4, 4, 60, 60], fill="#22c55e")
+    draw.ellipse([4, 4, 60, 60], fill="#007aff")
     return img
 
 def start_tray():
