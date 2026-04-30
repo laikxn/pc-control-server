@@ -365,17 +365,32 @@ def collect_stats() -> dict:
 # PC commands
 # /f flag forces processes to close even on a locked session (no admin needed)
 # ─────────────────────────────────────────────
+def _run_hidden(cmd: list) -> bool:
+    """Run a Windows command without showing a console window."""
+    import subprocess
+    try:
+        if os.name == "nt":
+            CREATE_NO_WINDOW = 0x08000000
+            subprocess.Popen(cmd, creationflags=CREATE_NO_WINDOW,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception as e:
+        print(f"[CMD ERROR] {e}")
+        return False
+
 def shutdown_pc() -> bool:
     print("[ACTION] Shutdown")
-    return os.system("shutdown /s /t 0 /f") == 0
+    return _run_hidden(["shutdown", "/s", "/t", "0", "/f"])
 
 def restart_pc() -> bool:
     print("[ACTION] Restart")
-    return os.system("shutdown /r /t 0 /f") == 0
+    return _run_hidden(["shutdown", "/r", "/t", "0", "/f"])
 
 def lock_pc() -> bool:
     print("[ACTION] Lock")
-    return os.system("rundll32.exe user32.dll,LockWorkStation") == 0
+    return _run_hidden(["rundll32.exe", "user32.dll,LockWorkStation"])
 
 # ─────────────────────────────────────────────
 # Volume control (Windows only, requires pycaw)

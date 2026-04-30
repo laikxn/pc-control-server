@@ -24,9 +24,9 @@ VSVersionInfo(
             StringStruct(u'CompanyName',      u'PCLink'),
             StringStruct(u'FileDescription',  u'PCLink Agent'),
             StringStruct(u'FileVersion',      u'1.0.0'),
-            StringStruct(u'InternalName',     u'PCLink-Agent'),
+            StringStruct(u'InternalName',     u'PC Link'),
             StringStruct(u'LegalCopyright',   u'Copyright 2025 PCLink'),
-            StringStruct(u'OriginalFilename', u'PCLink-Agent.exe'),
+            StringStruct(u'OriginalFilename', u'PC Link.exe'),
             StringStruct(u'ProductName',      u'PCLink'),
             StringStruct(u'ProductVersion',   u'1.0.0'),
           ]
