@@ -1,5 +1,5 @@
 """
-PC Control Hub — Agent
+PCLink — Agent
 Runs silently on your Windows PC after first pairing.
 
 Install dependencies:
@@ -76,7 +76,7 @@ if os.name == "nt":
 # App data directory — always use %APPDATA%\PCControlHub
 # so files persist correctly whether running as .py or .exe
 # ─────────────────────────────────────────────
-APP_NAME = "PCControlHub"
+APP_NAME = "PCLink"
 
 def get_app_dir() -> str:
     """Return the app data directory, creating it if needed."""
@@ -96,7 +96,7 @@ STARTUP_QUEUE_FILE = os.path.join(APP_DIR, "startup_queue.json")
 
 PAIR_CODE_TTL      = 120
 STATS_INTERVAL     = 3
-AUTOSTART_REG_NAME = "PCControlHubAgent"
+AUTOSTART_REG_NAME = "PCLinkAgent"
 APP_VERSION        = "1.0.0"
 
 # ─────────────────────────────────────────────
@@ -925,7 +925,7 @@ def start_tray():
         pystray.MenuItem("Restart Agent",         tray_on_restart),
         pystray.MenuItem("Quit",                  tray_on_quit),
     )
-    icon = pystray.Icon("PC Control Hub", make_tray_image(), "PC Control Hub", menu)
+    icon = pystray.Icon("PCLink", make_tray_image(), "PCLink", menu)
     tray_ref["icon"] = icon
     icon.run()
 
@@ -946,7 +946,7 @@ def handle_file_picker_request(request_id: str):
         # Remove topmost after 200ms so user can switch windows behind it
         root.after(200, lambda: root.attributes("-topmost", False))
         path = filedialog.askopenfilename(
-            title="Select File for Custom Action — PC Control Hub",
+            title="Select File for Custom Action — PCLink",
             filetypes=[
                 ("Executables & Shortcuts", "*.exe *.bat *.cmd *.ps1 *.lnk"),
                 ("All Files", "*.*"),
@@ -1016,7 +1016,7 @@ def _styled_button(parent, text, bg, fg="#ffffff", command=None, width=None):
 def _topmost_dialog(title: str, message: str, kind: str = "yesno", extra_button: str | None = None):
     result = [None]
     dlg = tk.Tk()
-    dlg.title("PC Control Hub")
+    dlg.title("PCLink")
     dlg.configure(bg=UI["bg"])
     dlg.resizable(False, False)
     dlg.attributes("-topmost", True)
@@ -1098,7 +1098,7 @@ def show_pair_popup():
 
     root = tk.Tk()
     popup_ref["root"] = root
-    root.title("PC Control Hub — Pair Device")
+    root.title("PCLink — Pair Device")
     root.configure(bg=UI["bg"])
     root.resizable(False, False)
     root.attributes("-topmost", True)
@@ -1113,7 +1113,7 @@ def show_pair_popup():
     # Header
     hdr = tk.Frame(root, bg=UI["bg"])
     hdr.pack(fill="x", padx=24, pady=(18, 0))
-    tk.Label(hdr, text="PC Control Hub", font=_font(15, "bold"),
+    tk.Label(hdr, text="PCLink", font=_font(15, "bold"),
              bg=UI["bg"], fg=UI["text"]).pack(anchor="w")
     tk.Label(hdr, text="Pair a new device", font=_font(10),
              bg=UI["bg"], fg=UI["text_sub"]).pack(anchor="w", pady=(2,0))
@@ -1123,7 +1123,7 @@ def show_pair_popup():
 
     if QR_AVAILABLE:
         # Instructions
-        tk.Label(root, text="Scan QR code with the PC Control Hub app",
+        tk.Label(root, text="Scan QR code with the PCLink app",
                  font=_font(9), bg=UI["bg"], fg=UI["text_sub"]).pack(pady=(10,6))
 
         # QR code — white card
@@ -1193,12 +1193,12 @@ def handle_unpaired_dialog():
         show_pair_popup()
     else:
         uninstall = _topmost_dialog(
-            "Uninstall PC Control Hub?",
-            "Would you like to uninstall PC Control Hub from this PC?",
+            "Uninstall PCLink?",
+            "Would you like to uninstall PCLink from this PC?",
             kind="yesno"
         )
         if uninstall:
-            _topmost_dialog("PC Control Hub",
+            _topmost_dialog("PCLink",
                 "The application will now close.\nYou can uninstall it from Windows Settings → Apps.",
                 kind="info")
             sys.exit(0)
