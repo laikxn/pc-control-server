@@ -121,7 +121,7 @@ def save_config(data: dict):
         print(f"[CONFIG] Save error: {e}")
 
 _cfg       = load_config()
-SERVER_URL = _cfg.get("server_url", "")  # set during pairing
+SERVER_URL = "ws://192.168.1.230:8000"
 
 # ─────────────────────────────────────────────
 # Auto-start registry
@@ -1230,77 +1230,18 @@ def handle_tray_restart():
     time.sleep(0.3)
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
-def show_server_setup_dialog() -> str | None:
-    """
-    Show a setup dialog on first run asking for the server IP/URL.
-    Returns the entered URL or None if cancelled.
-    """
-    result = [None]
-    dlg = tk.Tk()
-    dlg.title("PC Control Hub — Setup")
-    dlg.configure(bg=UI["bg"])
-    dlg.resizable(False, False)
-    dlg.attributes("-topmost", True)
-    dlg.lift(); dlg.focus_force()
-    _center(dlg, 460, 280)
-
-    tk.Frame(dlg, bg=UI["accent"], height=3).pack(fill="x")
-
-    tk.Label(dlg, text="PC Control Hub Setup", font=_font(13,"bold"),
-             bg=UI["bg"], fg=UI["text"], anchor="w", padx=24, pady=14).pack(fill="x")
-    tk.Frame(dlg, bg=UI["border"], height=1).pack(fill="x")
-
-    body = tk.Frame(dlg, bg=UI["bg"], padx=24, pady=16)
-    body.pack(fill="x")
-
-    tk.Label(body, text="Enter the IP address of the PC running the server.\nThis is shown in the server console when you run server.py.",
-             font=_font(10), bg=UI["bg"], fg=UI["text_sub"],
-             justify="left", anchor="w").pack(fill="x")
-
-    tk.Label(body, text="Server URL:", font=_font(10,"bold"),
-             bg=UI["bg"], fg=UI["text"], anchor="w").pack(fill="x", pady=(12,4))
-
-    entry_var = tk.StringVar(value="ws://192.168.1.")
-    entry = tk.Entry(body, textvariable=entry_var, font=_font(11,"normal","Courier New"),
-                     bg=UI["surface"], fg=UI["code_fg"], insertbackground=UI["code_fg"],
-                     relief="flat", bd=6)
-    entry.pack(fill="x")
-    entry.icursor(tk.END)
-
-    def on_confirm():
-        val = entry_var.get().strip()
-        if not val.startswith("ws://"):
-            val = f"ws://{val}"
-        if not val.endswith(":8000"):
-            val = f"{val.rstrip('/')}:8000"
-        result[0] = val
-        dlg.destroy()
-
-    def on_cancel():
-        dlg.destroy()
-
-    btn_frame = tk.Frame(dlg, bg=UI["bg"], padx=24, pady=4)
-    btn_frame.pack(fill="x")
-    _styled_button(btn_frame, "Connect", UI["btn_primary"], command=on_confirm).pack(side="right", padx=(6,0))
-    _styled_button(btn_frame, "Cancel",  UI["btn_neutral"], command=on_cancel).pack(side="right")
-
-    entry.bind("<Return>", lambda e: on_confirm())
-    dlg.mainloop()
-    return result[0]
+def handle_tray_change_server():
+    """Allow updating the server URL via tray — useful when IP changes."""
+    url = _topmost_dialog(
+        "Change Server URL",
+        f"Current server: {SERVER_URL}\n\nTo change the server URL, edit config.json in:\n{APP_DIR}",
+        kind="info"
+    )
 
 # ─────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
-    # First-run setup: if no server URL is configured, ask the user
-    if not SERVER_URL:
-        url = show_server_setup_dialog()
-        if not url:
-            print("[EXIT] No server URL provided."); sys.exit(0)
-        save_config({"server_url": url})
-        # Reload SERVER_URL from config
-        SERVER_URL = url
-
     print(f"[AGENT] v{APP_VERSION}")
     print(f"[AGENT] Device:    {DEVICE_NAME} ({DEVICE_ID})")
     print(f"[AGENT] MAC:       {DEVICE_MAC}")
@@ -1356,9 +1297,4 @@ if __name__ == "__main__":
             handle_file_picker_request(fp["request_id"])
         if flags["change_server"]:
             flags["change_server"] = False
-            url = show_server_setup_dialog()
-            if url:
-                save_config({"server_url": url})
-                _topmost_dialog("Server Updated",
-                    f"Server URL saved.\n\nRestarting agent to connect to:\n{url}", kind="info")
-                handle_tray_restart()
+            handle_tray_change_server()
