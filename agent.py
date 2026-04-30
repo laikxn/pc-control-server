@@ -563,39 +563,35 @@ def find_epic_appid_for_path(exe_path: str):
         print(f"[EPIC DETECT] Error: {e}")
     return None
 
-def run_file(path: str) -> bool:
+def run_file(path: str, run_as_admin: bool = False) -> bool:
     """
     Run an exe, script, steam:// URL, or any file with its default handler.
+    If run_as_admin=True, uses ShellExecute with 'runas' verb on Windows to
+    trigger a UAC elevation prompt and launch with admin privileges.
 
-    Auto-detects:
-      - Steam games (steamapps/common/...): looks up App ID from .acf manifests,
-        launches via steam://rungameid/APPID
-      - Epic Games (Epic/... install dir): looks up app name from LauncherInstalled.dat,
-        launches via Epic launcher URI
-      - .lnk / .url shortcuts: launched directly via os.startfile (works for Steam,
-        Epic, Xbox shortcuts created via right-click > Create Shortcut)
-      - Manual steam://rungameid/APPID paths: passed through directly
-
-    Tip: For any game launcher, creating a desktop shortcut and using the .lnk path
-    is the most reliable method if auto-detection doesn't work.
+    Auto-detects Steam games (steamapps/common/...) and Epic Games installs,
+    launching via their respective launcher URIs for proper dependency loading.
+    Use a .lnk shortcut path for Xbox Game Pass or any other launcher.
     """
-    print(f"[ACTION] Run: {path}")
+    print(f"[ACTION] Run: {path} (admin={run_as_admin})")
     try:
         path_lower = path.lower().replace("\\", "/")
 
-        # Already a protocol URL — pass through directly
-        if any(path_lower.startswith(p) for p in ("steam://", "com.epicgames", "xbox://", "http://", "https://")):
+        # Protocol URLs — pass through directly
+        if any(path_lower.startswith(p) for p in ("steam://","com.epicgames","xbox://","http://","https://")):
             if os.name == "nt":
                 os.startfile(path)
             else:
-                import subprocess
-                subprocess.Popen(["xdg-open", path])
+                import subprocess; subprocess.Popen(["xdg-open", path])
             return True
 
-        # .lnk or .url shortcut — launch directly, Windows resolves the target
+        # .lnk or .url shortcuts
         if path_lower.endswith(".lnk") or path_lower.endswith(".url"):
-            print(f"[ACTION] Launching shortcut: {path}")
-            os.startfile(path)
+            if run_as_admin and os.name == "nt":
+                import ctypes
+                ctypes.windll.shell32.ShellExecuteW(None, "runas", path, None, None, 1)
+            else:
+                os.startfile(path)
             return True
 
         # Auto-detect Steam games
@@ -603,30 +599,33 @@ def run_file(path: str) -> bool:
             appid = find_steam_appid_for_path(path)
             if appid:
                 steam_url = f"steam://rungameid/{appid}"
-                print(f"[ACTION] Steam game detected — launching via {steam_url}")
+                print(f"[ACTION] Steam game — launching via {steam_url}")
                 os.startfile(steam_url) if os.name == "nt" else __import__("subprocess").Popen(["xdg-open", steam_url])
                 return True
-            else:
-                print(f"[ACTION] Steam path detected but App ID not found — trying direct launch")
+            print(f"[ACTION] Steam path — App ID not found, trying direct launch")
 
         # Auto-detect Epic Games
         if os.name == "nt":
-            epic_dirs = ["epic games", "epicgames", "fortnite", "unrealengine"]
-            if any(d in path_lower for d in epic_dirs):
+            if any(d in path_lower for d in ["epic games","epicgames","fortnite"]):
                 epic_uri = find_epic_appid_for_path(path)
                 if epic_uri:
-                    print(f"[ACTION] Epic game detected — launching via {epic_uri}")
+                    print(f"[ACTION] Epic game — launching via {epic_uri}")
                     os.startfile(epic_uri)
                     return True
-                else:
-                    print(f"[ACTION] Epic path detected but app not found — trying direct launch")
 
-        # Default: launch directly
+        # Default launch
         if os.name == "nt":
-            os.startfile(path)
+            if run_as_admin:
+                import ctypes
+                # ShellExecute with 'runas' triggers UAC elevation prompt
+                ret = ctypes.windll.shell32.ShellExecuteW(None, "runas", path, None, None, 1)
+                if ret <= 32:
+                    print(f"[ACTION] ShellExecute runas failed: {ret}")
+                    return False
+            else:
+                os.startfile(path)
         else:
-            import subprocess
-            subprocess.Popen(["xdg-open", path])
+            import subprocess; subprocess.Popen(["xdg-open", path])
         return True
     except Exception as e:
         print(f"[RUN FILE ERROR] {e}")
@@ -728,9 +727,10 @@ async def handle_command(cmd, ws):
             else:
                 status = "failed"
         elif t == "run_custom_action":
-            path = cmd.get("path", "")
+            path         = cmd.get("path", "")
+            run_as_admin = cmd.get("run_as_admin", False)
             if path:
-                if not run_file(path): status = "failed"
+                if not run_file(path, run_as_admin=run_as_admin): status = "failed"
             else:
                 status = "failed"
         elif t == "open_file_picker":
