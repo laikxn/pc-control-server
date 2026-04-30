@@ -73,28 +73,77 @@ if os.name == "nt":
         print("[WARN] pycaw not installed. Run: pip install pycaw  (Windows volume mixer disabled)")
 
 # ─────────────────────────────────────────────
-# Config
+# App data directory — always use %APPDATA%\PCControlHub
+# so files persist correctly whether running as .py or .exe
 # ─────────────────────────────────────────────
-SERVER_URL         = "ws://192.168.1.230:8000"
-DEVICE_ID_FILE     = "device_id.txt"
-PAIRED_FILE        = "paired.json"
-STARTUP_QUEUE_FILE = "startup_queue.json"
+APP_NAME = "PCControlHub"
+
+def get_app_dir() -> str:
+    """Return the app data directory, creating it if needed."""
+    if os.name == "nt":
+        base = os.environ.get("APPDATA", os.path.expanduser("~"))
+    else:
+        base = os.path.expanduser("~/.config")
+    app_dir = os.path.join(base, APP_NAME)
+    os.makedirs(app_dir, exist_ok=True)
+    return app_dir
+
+APP_DIR            = get_app_dir()
+CONFIG_FILE        = os.path.join(APP_DIR, "config.json")
+DEVICE_ID_FILE     = os.path.join(APP_DIR, "device_id.txt")
+PAIRED_FILE        = os.path.join(APP_DIR, "paired.json")
+STARTUP_QUEUE_FILE = os.path.join(APP_DIR, "startup_queue.json")
+
 PAIR_CODE_TTL      = 120
 STATS_INTERVAL     = 3
 AUTOSTART_REG_NAME = "PCControlHubAgent"
+APP_VERSION        = "1.0.0"
+
+# ─────────────────────────────────────────────
+# Config — SERVER_URL stored in config.json,
+# set during pairing from the QR code data
+# ─────────────────────────────────────────────
+def load_config() -> dict:
+    try:
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, "r") as f:
+                return json.load(f)
+    except: pass
+    return {}
+
+def save_config(data: dict):
+    try:
+        cfg = load_config()
+        cfg.update(data)
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception as e:
+        print(f"[CONFIG] Save error: {e}")
+
+_cfg       = load_config()
+SERVER_URL = _cfg.get("server_url", "")  # set during pairing
 
 # ─────────────────────────────────────────────
 # Auto-start registry
 # ─────────────────────────────────────────────
+def get_exe_path() -> str:
+    """Return the correct executable path whether running as .py or PyInstaller .exe."""
+    if getattr(sys, "frozen", False):
+        # Running as compiled PyInstaller exe
+        return sys.executable
+    else:
+        # Running as Python script
+        return f'"{sys.executable}" "{os.path.abspath(__file__)}"'
+
 def setup_autostart():
     if os.name != "nt":
         return
     try:
         import winreg
-        exe_path = sys.executable
+        exe_path = get_exe_path()
         key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as key:
-            winreg.SetValueEx(key, AUTOSTART_REG_NAME, 0, winreg.REG_SZ, f'"{exe_path}"')
+            winreg.SetValueEx(key, AUTOSTART_REG_NAME, 0, winreg.REG_SZ, exe_path)
         print(f"[AUTOSTART] Registered: {exe_path}")
     except Exception as e:
         print(f"[AUTOSTART] Failed: {e}")
@@ -223,7 +272,8 @@ flags = {
     "tray_restart":        False,
     "we_initiated_unpair": False,
     "file_picker_request": None,
-    "volume_subscribed":   False,   # True while mobile has volume screen open
+    "volume_subscribed":   False,
+    "change_server":       False,
 }
 
 loop_ref      = {"loop": None}
@@ -856,10 +906,11 @@ def run_async():
 # ─────────────────────────────────────────────
 # Tray
 # ─────────────────────────────────────────────
-def tray_on_pair(icon, item):    flags["show_qr"]      = True
-def tray_on_unpair(icon, item):  flags["tray_unpair"]  = True
-def tray_on_restart(icon, item): flags["tray_restart"] = True
-def tray_on_quit(icon, item):    flags["tray_quit"]    = True
+def tray_on_pair(icon, item):          flags["show_qr"]           = True
+def tray_on_unpair(icon, item):        flags["tray_unpair"]       = True
+def tray_on_restart(icon, item):       flags["tray_restart"]      = True
+def tray_on_quit(icon, item):          flags["tray_quit"]         = True
+def tray_on_change_server(icon, item): flags["change_server"]     = True
 
 def make_tray_image():
     img  = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
@@ -873,6 +924,7 @@ def start_tray():
         pystray.MenuItem("Pair / Repair Device", tray_on_pair),
         pystray.MenuItem("Unpair Device",         tray_on_unpair),
         pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Change Server URL",     tray_on_change_server),
         pystray.MenuItem("Restart Agent",         tray_on_restart),
         pystray.MenuItem("Quit",                  tray_on_quit),
     )
@@ -1178,12 +1230,81 @@ def handle_tray_restart():
     time.sleep(0.3)
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
+def show_server_setup_dialog() -> str | None:
+    """
+    Show a setup dialog on first run asking for the server IP/URL.
+    Returns the entered URL or None if cancelled.
+    """
+    result = [None]
+    dlg = tk.Tk()
+    dlg.title("PC Control Hub — Setup")
+    dlg.configure(bg=UI["bg"])
+    dlg.resizable(False, False)
+    dlg.attributes("-topmost", True)
+    dlg.lift(); dlg.focus_force()
+    _center(dlg, 460, 280)
+
+    tk.Frame(dlg, bg=UI["accent"], height=3).pack(fill="x")
+
+    tk.Label(dlg, text="PC Control Hub Setup", font=_font(13,"bold"),
+             bg=UI["bg"], fg=UI["text"], anchor="w", padx=24, pady=14).pack(fill="x")
+    tk.Frame(dlg, bg=UI["border"], height=1).pack(fill="x")
+
+    body = tk.Frame(dlg, bg=UI["bg"], padx=24, pady=16)
+    body.pack(fill="x")
+
+    tk.Label(body, text="Enter the IP address of the PC running the server.\nThis is shown in the server console when you run server.py.",
+             font=_font(10), bg=UI["bg"], fg=UI["text_sub"],
+             justify="left", anchor="w").pack(fill="x")
+
+    tk.Label(body, text="Server URL:", font=_font(10,"bold"),
+             bg=UI["bg"], fg=UI["text"], anchor="w").pack(fill="x", pady=(12,4))
+
+    entry_var = tk.StringVar(value="ws://192.168.1.")
+    entry = tk.Entry(body, textvariable=entry_var, font=_font(11,"normal","Courier New"),
+                     bg=UI["surface"], fg=UI["code_fg"], insertbackground=UI["code_fg"],
+                     relief="flat", bd=6)
+    entry.pack(fill="x")
+    entry.icursor(tk.END)
+
+    def on_confirm():
+        val = entry_var.get().strip()
+        if not val.startswith("ws://"):
+            val = f"ws://{val}"
+        if not val.endswith(":8000"):
+            val = f"{val.rstrip('/')}:8000"
+        result[0] = val
+        dlg.destroy()
+
+    def on_cancel():
+        dlg.destroy()
+
+    btn_frame = tk.Frame(dlg, bg=UI["bg"], padx=24, pady=4)
+    btn_frame.pack(fill="x")
+    _styled_button(btn_frame, "Connect", UI["btn_primary"], command=on_confirm).pack(side="right", padx=(6,0))
+    _styled_button(btn_frame, "Cancel",  UI["btn_neutral"], command=on_cancel).pack(side="right")
+
+    entry.bind("<Return>", lambda e: on_confirm())
+    dlg.mainloop()
+    return result[0]
+
 # ─────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
+    # First-run setup: if no server URL is configured, ask the user
+    if not SERVER_URL:
+        url = show_server_setup_dialog()
+        if not url:
+            print("[EXIT] No server URL provided."); sys.exit(0)
+        save_config({"server_url": url})
+        # Reload SERVER_URL from config
+        SERVER_URL = url
+
+    print(f"[AGENT] v{APP_VERSION}")
     print(f"[AGENT] Device:    {DEVICE_NAME} ({DEVICE_ID})")
     print(f"[AGENT] MAC:       {DEVICE_MAC}")
+    print(f"[AGENT] Data dir:  {APP_DIR}")
     print(f"[AGENT] Server:    {SERVER_URL}")
     print(f"[AGENT] Paired:    {is_paired()}")
     print(f"[AGENT] psutil:    {PSUTIL_AVAILABLE}")
@@ -1229,8 +1350,15 @@ if __name__ == "__main__":
         if flags["tray_unpair"]:
             flags["tray_unpair"] = False
             handle_tray_unpair()
-        # File picker must run on main thread (tkinter requirement)
         fp = flags.get("file_picker_request")
         if fp:
             flags["file_picker_request"] = None
             handle_file_picker_request(fp["request_id"])
+        if flags["change_server"]:
+            flags["change_server"] = False
+            url = show_server_setup_dialog()
+            if url:
+                save_config({"server_url": url})
+                _topmost_dialog("Server Updated",
+                    f"Server URL saved.\n\nRestarting agent to connect to:\n{url}", kind="info")
+                handle_tray_restart()
