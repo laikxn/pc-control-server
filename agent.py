@@ -273,7 +273,6 @@ flags = {
     "we_initiated_unpair": False,
     "file_picker_request": None,
     "volume_subscribed":   False,
-    "change_server":       False,
 }
 
 loop_ref      = {"loop": None}
@@ -906,11 +905,10 @@ def run_async():
 # ─────────────────────────────────────────────
 # Tray
 # ─────────────────────────────────────────────
-def tray_on_pair(icon, item):          flags["show_qr"]           = True
-def tray_on_unpair(icon, item):        flags["tray_unpair"]       = True
-def tray_on_restart(icon, item):       flags["tray_restart"]      = True
-def tray_on_quit(icon, item):          flags["tray_quit"]         = True
-def tray_on_change_server(icon, item): flags["change_server"]     = True
+def tray_on_pair(icon, item):    flags["show_qr"]     = True
+def tray_on_unpair(icon, item):  flags["tray_unpair"] = True
+def tray_on_restart(icon, item): flags["tray_restart"]= True
+def tray_on_quit(icon, item):    flags["tray_quit"]   = True
 
 def make_tray_image():
     img  = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
@@ -924,7 +922,6 @@ def start_tray():
         pystray.MenuItem("Pair / Repair Device", tray_on_pair),
         pystray.MenuItem("Unpair Device",         tray_on_unpair),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Change Server URL",     tray_on_change_server),
         pystray.MenuItem("Restart Agent",         tray_on_restart),
         pystray.MenuItem("Quit",                  tray_on_quit),
     )
@@ -1230,13 +1227,6 @@ def handle_tray_restart():
     time.sleep(0.3)
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
-def handle_tray_change_server():
-    """Allow updating the server URL via tray — useful when IP changes."""
-    url = _topmost_dialog(
-        "Change Server URL",
-        f"Current server: {SERVER_URL}\n\nTo change the server URL, edit config.json in:\n{APP_DIR}",
-        kind="info"
-    )
 
 # ─────────────────────────────────────────────
 # Entry point
@@ -1295,6 +1285,3 @@ if __name__ == "__main__":
         if fp:
             flags["file_picker_request"] = None
             handle_file_picker_request(fp["request_id"])
-        if flags["change_server"]:
-            flags["change_server"] = False
-            handle_tray_change_server()
