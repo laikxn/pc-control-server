@@ -569,7 +569,6 @@ async def handler(ws):
             # ── FILE BROWSER: MOBILE → AGENT ──
             elif msg_type in ["browse_files", "download_file"]:
                 target_id = data.get("device_id"); token = data.get("token", "")
-                print(f"[FILES] {msg_type} for {target_id}, connected devices: {list(devices.keys())}")
                 if not target_id: continue
                 if target_id in device_tokens and not validate_token(target_id, token):
                     await reject_token(ws, target_id); continue
