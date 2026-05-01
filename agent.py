@@ -98,6 +98,24 @@ PAIR_CODE_TTL      = 120
 STATS_INTERVAL     = 3
 AUTOSTART_REG_NAME = "PCLinkAgent"
 APP_VERSION        = "1.0.0"
+WORKER_URL         = "https://pclink-lookup.laiken.workers.dev"  # Cloudflare Worker URL
+
+def register_code_with_worker(code: str):
+    """Register the pairing code + server URL with the Cloudflare Worker lookup service."""
+    try:
+        import urllib.request, urllib.error
+        payload = json.dumps({"code": code, "url": SERVER_URL}).encode()
+        req = urllib.request.Request(
+            f"{WORKER_URL}/register",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            result = json.loads(resp.read())
+            print(f"[WORKER] Code {code} registered (expires in {result.get('expires_in', '?')}s)")
+    except Exception as e:
+        print(f"[WORKER] Failed to register code: {e}")
 
 # ─────────────────────────────────────────────
 # Config — SERVER_URL stored in config.json,
@@ -1120,6 +1138,8 @@ def close_popup_if_open():
 def _fresh_code() -> str:
     code = str(random.randint(100000, 999999))
     pair_code_ref["code"] = code
+    # Register with Cloudflare Worker so mobile can look up URL by code only
+    threading.Thread(target=register_code_with_worker, args=(code,), daemon=True).start()
     return code
 
 def _do_unpair_and_notify():
