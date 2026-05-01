@@ -917,6 +917,15 @@ async def handle_command(cmd, ws):
             file_path = cmd.get("path", "")
             try:
                 import base64, mimetypes
+                file_size = os.path.getsize(file_path)
+                MAX_SIZE = 20 * 1024 * 1024  # 20MB limit
+                if file_size > MAX_SIZE:
+                    await ws.send(json.dumps({
+                        "type":"file_download_result","device_id":DEVICE_ID,
+                        "name":os.path.basename(file_path),
+                        "error":f"File too large ({file_size//1024//1024}MB). Maximum size is 20MB.",
+                    }))
+                    return
                 mime = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
                 with open(file_path, "rb") as f:
                     data = base64.b64encode(f.read()).decode()
@@ -927,7 +936,7 @@ async def handle_command(cmd, ws):
                     "data":      data,
                     "mime_type": mime,
                 }))
-                print(f"[FILES] Sent: {file_path}")
+                print(f"[FILES] Sent: {file_path} ({file_size//1024}KB)")
             except Exception as e:
                 print(f"[FILES] Error: {e}")
                 await ws.send(json.dumps({
@@ -1003,7 +1012,8 @@ async def connect():
                 import ssl
                 ssl_ctx = ssl.create_default_context()
             async with websockets.connect(SERVER_URL, ssl=ssl_ctx,
-                additional_headers={"ngrok-skip-browser-warning": "1"}) as ws:
+                additional_headers={"ngrok-skip-browser-warning": "1"},
+                max_size=50*1024*1024) as ws:
                 ws_ref["ws"] = ws
                 print("[CONNECTED]")
                 await ws.send(json.dumps({
