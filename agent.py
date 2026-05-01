@@ -121,7 +121,7 @@ def save_config(data: dict):
         print(f"[CONFIG] Save error: {e}")
 
 _cfg       = load_config()
-SERVER_URL = "ws://192.168.1.230:8000"
+SERVER_URL = "wss://frothier-claire-enterologic.ngrok-free.dev"
 
 # ─────────────────────────────────────────────
 # Auto-start registry
@@ -874,7 +874,13 @@ async def connect():
 
     while True:
         try:
-            async with websockets.connect(SERVER_URL) as ws:
+            # Use SSL for wss:// connections (ngrok), plain for ws://
+            ssl_ctx = None
+            if SERVER_URL.startswith("wss://"):
+                import ssl
+                ssl_ctx = ssl.create_default_context()
+            async with websockets.connect(SERVER_URL, ssl=ssl_ctx,
+                additional_headers={"ngrok-skip-browser-warning": "1"}) as ws:
                 ws_ref["ws"] = ws
                 print("[CONNECTED]")
                 await ws.send(json.dumps({
