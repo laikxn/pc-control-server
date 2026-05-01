@@ -918,7 +918,7 @@ async def handle_command(cmd, ws):
             try:
                 import base64, mimetypes
                 file_size = os.path.getsize(file_path)
-                MAX_SIZE = 100 * 1024 * 1024  # 100MB limit
+                MAX_SIZE = 1024 * 1024 * 1024  # 1GB limit
                 if file_size > MAX_SIZE:
                     await ws.send(json.dumps({
                         "type":"file_download_result","device_id":DEVICE_ID,
@@ -1013,7 +1013,7 @@ async def connect():
                 ssl_ctx = ssl.create_default_context()
             async with websockets.connect(SERVER_URL, ssl=ssl_ctx,
                 additional_headers={"ngrok-skip-browser-warning": "1"},
-                max_size=50*1024*1024) as ws:
+                max_size=2*1024*1024*1024) as ws:
                 ws_ref["ws"] = ws
                 print("[CONNECTED]")
                 await ws.send(json.dumps({

@@ -1,4 +1,4 @@
-# import asyncio
+import asyncio
 import websockets
 import json
 import random
@@ -645,7 +645,7 @@ async def main():
     now = datetime.datetime.now()
     print(f"[SERVER STARTED] ws://0.0.0.0:8000")
     print(f"[SERVER TIME]    {now.strftime('%Y-%m-%d %H:%M:%S')} (local) — if this doesn't match your phone's time, set TZ env var")
-    async with websockets.serve(handler, "0.0.0.0", 8000, max_size=150*1024*1024):
+    async with websockets.serve(handler, "0.0.0.0", 8000, max_size=2*1024*1024*1024):
         asyncio.create_task(state_monitor())
         asyncio.create_task(scheduler_loop())
         await asyncio.Future()
