@@ -98,7 +98,7 @@ PAIR_CODE_TTL      = 120
 STATS_INTERVAL     = 3
 AUTOSTART_REG_NAME = "PCLinkAgent"
 APP_VERSION        = "1.0.0"
-WORKER_URL         = "https://pclink-lookup.laiken.workers.dev"  # Cloudflare Worker URL
+WORKER_URL         = "https://pclink-lookup.lcarney2007.workers.dev"
 
 def register_code_with_worker(code: str):
     """Register the pairing code + server URL with the Cloudflare Worker lookup service."""
