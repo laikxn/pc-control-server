@@ -918,7 +918,7 @@ async def handle_command(cmd, ws):
             try:
                 import base64, mimetypes
                 file_size = os.path.getsize(file_path)
-                MAX_SIZE = 20 * 1024 * 1024  # 20MB limit
+                MAX_SIZE = 100 * 1024 * 1024  # 100MB limit
                 if file_size > MAX_SIZE:
                     await ws.send(json.dumps({
                         "type":"file_download_result","device_id":DEVICE_ID,
