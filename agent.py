@@ -25,6 +25,8 @@ import signal
 import sys
 import tkinter as tk
 from tkinter import font as tkfont, filedialog
+import warnings
+warnings.filterwarnings("ignore", category=RuntimeWarning)
 from io import BytesIO
 
 try:
@@ -99,6 +101,24 @@ STATS_INTERVAL     = 3
 AUTOSTART_REG_NAME = "PCLinkAgent"
 APP_VERSION        = "1.0.0"
 WORKER_URL         = "https://pclink-lookup.lcarney2007.workers.dev"
+
+def check_for_updates():
+    """Check GitHub releases for a newer version and prompt user to download."""
+    try:
+        import urllib.request, json as _json
+        url = "https://api.github.com/repos/laikxn/PCLink/releases/latest"
+        req = urllib.request.Request(url, headers={"User-Agent":"PCLink-Agent"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = _json.loads(resp.read())
+        latest = data.get("tag_name","").lstrip("v")
+        current = APP_VERSION
+        if latest and latest != current:
+            print(f"[UPDATE] New version available: v{latest} (current: v{current})")
+            flags["update_available"] = latest
+        else:
+            print(f"[UPDATE] Up to date (v{current})")
+    except Exception as e:
+        print(f"[UPDATE] Check failed: {e}")
 
 def register_code_with_worker(code: str):
     """Register the pairing code + server URL with the Cloudflare Worker lookup service."""
@@ -291,6 +311,7 @@ flags = {
     "we_initiated_unpair": False,
     "file_picker_request": None,
     "volume_subscribed":   False,
+    "update_available":    None,   # set to version string if update found
 }
 
 loop_ref      = {"loop": None}
@@ -831,7 +852,91 @@ async def handle_command(cmd, ws):
                 "sessions":  sessions,
             }))
             return
-        elif t == "volume_subscribe":
+        elif t == "browse_files":
+            path = cmd.get("path", "")
+            print(f"[FILES] Browse: '{path}'")
+            try:
+                # Home screen — return common locations instantly
+                if not path:
+                    import pathlib
+                    home = str(pathlib.Path.home())
+                    common = [
+                        {"name":"Desktop",   "isDir":True, "path":home+"\\Desktop"},
+                        {"name":"Documents", "isDir":True, "path":home+"\\Documents"},
+                        {"name":"Downloads", "isDir":True, "path":home+"\\Downloads"},
+                        {"name":"Pictures",  "isDir":True, "path":home+"\\Pictures"},
+                        {"name":"Videos",    "isDir":True, "path":home+"\\Videos"},
+                        {"name":"Music",     "isDir":True, "path":home+"\\Music"},
+                        {"name":"C:\\",      "isDir":True, "path":"C:\\"},
+                    ]
+                    await ws.send(json.dumps({
+                        "type":"file_browse_result","device_id":DEVICE_ID,
+                        "path":"Home","entries":common,"is_home":True,"done":True,"offset":0,
+                    }))
+                    print(f"[FILES] Sent home ({len(common)} items)")
+                    return
+
+                dirs  = []
+                files = []
+                try:
+                    with os.scandir(path) as it:
+                        for entry in it:
+                            try:
+                                if entry.name.startswith("$") or entry.name.startswith("."):
+                                    continue
+                                is_dir = entry.is_dir(follow_symlinks=False)
+                                if is_dir:
+                                    dirs.append({"name":entry.name,"isDir":True})
+                                else:
+                                    files.append({"name":entry.name,"isDir":False})
+                            except: pass
+                except PermissionError:
+                    await ws.send(json.dumps({
+                        "type":"file_browse_result","device_id":DEVICE_ID,
+                        "path":path,"entries":[],"error":"Permission denied","done":True,"offset":0,
+                    }))
+                    return
+
+                dirs.sort(key=lambda e: e["name"].lower())
+                files.sort(key=lambda e: e["name"].lower())
+                all_entries = dirs + files
+                print(f"[FILES] Sending {len(all_entries)} entries for '{path}'")
+                await ws.send(json.dumps({
+                    "type":"file_browse_result","device_id":DEVICE_ID,
+                    "path":path,"entries":all_entries,"done":True,"offset":0,
+                }))
+
+            except Exception as e:
+                print(f"[FILES] Error: {e}")
+                await ws.send(json.dumps({
+                    "type":"file_browse_result","device_id":DEVICE_ID,
+                    "path":path,"entries":[],"error":str(e),"done":True,"offset":0,
+                }))
+            return
+        elif t == "download_file":
+            file_path = cmd.get("path", "")
+            try:
+                import base64, mimetypes
+                mime = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+                with open(file_path, "rb") as f:
+                    data = base64.b64encode(f.read()).decode()
+                await ws.send(json.dumps({
+                    "type":      "file_download_result",
+                    "device_id": DEVICE_ID,
+                    "name":      os.path.basename(file_path),
+                    "data":      data,
+                    "mime_type": mime,
+                }))
+                print(f"[FILES] Sent: {file_path}")
+            except Exception as e:
+                print(f"[FILES] Error: {e}")
+                await ws.send(json.dumps({
+                    "type":      "file_download_result",
+                    "device_id": DEVICE_ID,
+                    "name":      os.path.basename(file_path),
+                    "error":     str(e),
+                }))
+            return
             flags["volume_subscribed"] = True
             print("[VOLUME] Subscribed — polling active")
             return
@@ -1303,6 +1408,9 @@ if __name__ == "__main__":
 
     setup_autostart()
 
+    # Check for updates in background
+    threading.Thread(target=check_for_updates, daemon=True).start()
+
     def handle_sigint(sig, frame):
         print("\n[EXIT] Agent stopped."); sys.exit(0)
     signal.signal(signal.SIGINT, handle_sigint)
@@ -1345,3 +1453,14 @@ if __name__ == "__main__":
         if fp:
             flags["file_picker_request"] = None
             handle_file_picker_request(fp["request_id"])
+        update_ver = flags.get("update_available")
+        if update_ver:
+            flags["update_available"] = None
+            result = _topmost_dialog(
+                "Update Available",
+                f"PCLink Agent v{update_ver} is available.\nYou are running v{APP_VERSION}.\n\nWould you like to download the update?",
+                kind="yesno"
+            )
+            if result:
+                import webbrowser
+                webbrowser.open("https://github.com/laikxn/PCLink/releases/latest")

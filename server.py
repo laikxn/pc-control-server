@@ -566,6 +566,19 @@ async def handler(ws):
                     await ws.send(json.dumps({"type": "events_data", "device_id": target_id, "events": scheduled_events.get(target_id, [])}))
                 except: pass
 
+            # ── FILE BROWSER: MOBILE → AGENT ──
+            elif msg_type in ["browse_files", "download_file"]:
+                target_id = data.get("device_id"); token = data.get("token", "")
+                print(f"[FILES] {msg_type} for {target_id}, connected devices: {list(devices.keys())}")
+                if not target_id: continue
+                if target_id in device_tokens and not validate_token(target_id, token):
+                    await reject_token(ws, target_id); continue
+                await send_to_device(target_id, {k:v for k,v in data.items() if k != "token"})
+
+            # ── FILE BROWSE/DOWNLOAD RESULT: AGENT → MOBILE ──
+            elif msg_type in ["file_browse_result", "file_download_result"]:
+                await broadcast_to_mobile(data)
+
             # ── VOLUME: MOBILE → AGENT ──
             elif msg_type in ["get_volume", "set_master_volume", "set_session_volume",
                                "volume_subscribe", "volume_unsubscribe"]:
