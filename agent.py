@@ -480,7 +480,39 @@ def get_uptime() -> int:
 # ─────────────────────────────────────────────
 # Media controls (Windows only)
 # ─────────────────────────────────────────────
-def send_media_key(action: str) -> bool:
+def get_now_playing() -> dict | None:
+    """Get currently playing media info from Windows media session API."""
+    if os.name != "nt":
+        return None
+    try:
+        import subprocess
+        CREATE_NO_WINDOW = 0x08000000
+        ps_script = """
+try {
+    $sessions = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager,Windows.Media.Control,ContentType=WindowsRuntime]::RequestAsync().GetAwaiter().GetResult()
+    $session = $sessions.GetCurrentSession()
+    if ($session) {
+        $info = $session.TryGetMediaPropertiesAsync().GetAwaiter().GetResult()
+        $status = $session.GetPlaybackInfo().PlaybackStatus
+        Write-Output "$($info.Title)|$($info.Artist)|$status"
+    }
+} catch { Write-Output "||" }
+"""
+        result = subprocess.run(
+            ["powershell", "-command", ps_script],
+            capture_output=True, text=True, encoding="utf-8",
+            creationflags=CREATE_NO_WINDOW, timeout=3
+        )
+        parts = result.stdout.strip().split("|")
+        if len(parts) >= 2 and parts[0]:
+            return {
+                "title":  parts[0],
+                "artist": parts[1] if len(parts)>1 else "",
+                "status": parts[2] if len(parts)>2 else "",
+            }
+    except Exception as e:
+        print(f"[MEDIA INFO ERROR] {e}")
+    return None
     """Send a media key press using Windows API."""
     if os.name != "nt":
         return False
@@ -514,48 +546,34 @@ def get_clipboard() -> str | None:
     """Get the current clipboard text content."""
     try:
         if os.name == "nt":
-            import ctypes
-            ctypes.windll.user32.OpenClipboard(0)
-            CF_TEXT = 1
-            CF_UNICODETEXT = 13
-            handle = ctypes.windll.user32.GetClipboardData(CF_UNICODETEXT)
-            if not handle:
-                handle = ctypes.windll.user32.GetClipboardData(CF_TEXT)
-            if handle:
-                ptr = ctypes.windll.kernel32.GlobalLock(handle)
-                text = ctypes.wstring_at(ptr)
-                ctypes.windll.kernel32.GlobalUnlock(handle)
-                return text
+            import subprocess
+            CREATE_NO_WINDOW = 0x08000000
+            result = subprocess.run(
+                ["powershell", "-command", "Get-Clipboard"],
+                capture_output=True, text=True, encoding="utf-8",
+                creationflags=CREATE_NO_WINDOW
+            )
+            return result.stdout.rstrip("\n")
         else:
             import subprocess
             result = subprocess.run(["pbpaste"], capture_output=True, text=True)
             return result.stdout
     except Exception as e:
         print(f"[CLIPBOARD GET ERROR] {e}")
-    finally:
-        try:
-            if os.name == "nt":
-                import ctypes
-                ctypes.windll.user32.CloseClipboard()
-        except: pass
-    return None
+        return None
 
 def set_clipboard(text: str) -> bool:
     """Set the clipboard text content."""
     try:
         if os.name == "nt":
-            import ctypes, ctypes.wintypes
-            GMEM_MOVEABLE = 0x0002
-            ctypes.windll.user32.OpenClipboard(0)
-            ctypes.windll.user32.EmptyClipboard()
-            encoded = text.encode("utf-16-le") + b"\x00\x00"
-            handle = ctypes.windll.kernel32.GlobalAlloc(GMEM_MOVEABLE, len(encoded))
-            ptr = ctypes.windll.kernel32.GlobalLock(handle)
-            ctypes.memmove(ptr, encoded, len(encoded))
-            ctypes.windll.kernel32.GlobalUnlock(handle)
-            ctypes.windll.user32.SetClipboardData(13, handle)  # CF_UNICODETEXT
-            ctypes.windll.user32.CloseClipboard()
-            print(f"[CLIPBOARD] Set: {text[:50]}...")
+            import subprocess
+            CREATE_NO_WINDOW = 0x08000000
+            subprocess.run(
+                ["powershell", "-command", f"Set-Clipboard -Value '{text.replace(chr(39), chr(39)+chr(39))}'"],
+                creationflags=CREATE_NO_WINDOW,
+                capture_output=True
+            )
+            print(f"[CLIPBOARD] Set: {text[:50]}")
             return True
         else:
             import subprocess
@@ -569,23 +587,29 @@ def set_clipboard(text: str) -> bool:
 # Type text
 # ─────────────────────────────────────────────
 def type_text(text: str) -> bool:
-    """Type text using Windows SendInput API."""
+    """Type text on the PC using PowerShell SendKeys."""
     if os.name != "nt":
         return False
     try:
-        import ctypes, ctypes.wintypes
-        # Use clipboard paste for speed and Unicode support
-        original = get_clipboard()
-        set_clipboard(text)
-        # Send Ctrl+V
-        ctypes.windll.user32.keybd_event(0x11, 0, 0, 0)  # Ctrl down
-        ctypes.windll.user32.keybd_event(0x56, 0, 0, 0)  # V down
-        ctypes.windll.user32.keybd_event(0x56, 0, 2, 0)  # V up
-        ctypes.windll.user32.keybd_event(0x11, 0, 2, 0)  # Ctrl up
-        time.sleep(0.1)
-        # Restore original clipboard
-        if original:
-            set_clipboard(original)
+        import subprocess
+        CREATE_NO_WINDOW = 0x08000000
+        # Escape special SendKeys characters
+        special = "~%^+{}[]()"
+        escaped = ""
+        for c in text:
+            if c in special:
+                escaped += f"{{{c}}}"
+            else:
+                escaped += c
+        ps_script = f"""
+Add-Type -AssemblyName System.Windows.Forms
+[System.Windows.Forms.SendKeys]::SendWait('{escaped.replace("'", "''")}')
+"""
+        subprocess.run(
+            ["powershell", "-command", ps_script],
+            creationflags=CREATE_NO_WINDOW,
+            capture_output=True
+        )
         print(f"[TYPE] Typed: {text[:50]}")
         return True
     except Exception as e:
@@ -1013,6 +1037,20 @@ async def handle_command(cmd, ws):
         elif t == "media_control":
             action = cmd.get("action", "")
             if not send_media_key(action): status = "failed"
+            # After media key, send back now playing info
+            info = get_now_playing()
+            if info:
+                await ws.send(json.dumps({
+                    "type":"now_playing","device_id":DEVICE_ID,**info
+                }))
+            return
+        elif t == "get_now_playing":
+            info = get_now_playing()
+            await ws.send(json.dumps({
+                "type":"now_playing","device_id":DEVICE_ID,
+                **(info or {"title":None,"artist":None,"status":None})
+            }))
+            return
         elif t == "get_clipboard":
             text = get_clipboard()
             await ws.send(json.dumps({
