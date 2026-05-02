@@ -567,15 +567,15 @@ async def handler(ws):
                 except: pass
 
             # ── FILE BROWSER: MOBILE → AGENT ──
-            elif msg_type in ["browse_files", "download_file"]:
+            elif msg_type in ["browse_files", "download_file", "search_files"]:
                 target_id = data.get("device_id"); token = data.get("token", "")
                 if not target_id: continue
                 if target_id in device_tokens and not validate_token(target_id, token):
                     await reject_token(ws, target_id); continue
                 await send_to_device(target_id, {k:v for k,v in data.items() if k != "token"})
 
-            # ── FILE BROWSE/DOWNLOAD RESULT: AGENT → MOBILE ──
-            elif msg_type in ["file_browse_result", "file_download_result"]:
+            # ── FILE BROWSE/DOWNLOAD/SEARCH RESULT: AGENT → MOBILE ──
+            elif msg_type in ["file_browse_result", "file_download_result", "search_files_result"]:
                 await broadcast_to_mobile(data)
 
             # ── VOLUME: MOBILE → AGENT ──

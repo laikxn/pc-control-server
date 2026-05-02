@@ -946,6 +946,50 @@ async def handle_command(cmd, ws):
                     "error":     str(e),
                 }))
             return
+        elif t == "search_files":
+            query = cmd.get("query", "").lower().strip()
+            print(f"[FILES] Search: '{query}'")
+            try:
+                import pathlib
+                results = []
+                home = str(pathlib.Path.home())
+                search_roots = [
+                    home + "\\Desktop",
+                    home + "\\Documents",
+                    home + "\\Downloads",
+                    home + "\\Pictures",
+                    home + "\\Videos",
+                    home + "\\Music",
+                ]
+                for root in search_roots:
+                    if not os.path.exists(root):
+                        continue
+                    for dirpath, dirnames, filenames in os.walk(root):
+                        dirnames[:] = [d for d in dirnames if not d.startswith(".") and not d.startswith("$")]
+                        for fname in filenames:
+                            if query in fname.lower():
+                                results.append({
+                                    "name":  fname,
+                                    "isDir": False,
+                                    "path":  os.path.join(dirpath, fname),
+                                })
+                            if len(results) >= 200:
+                                break
+                        if len(results) >= 200:
+                            break
+                print(f"[FILES] Search found {len(results)} results")
+                await ws.send(json.dumps({
+                    "type":"search_files_result","device_id":DEVICE_ID,
+                    "query":query,"entries":results,
+                }))
+            except Exception as e:
+                print(f"[FILES] Search error: {e}")
+                await ws.send(json.dumps({
+                    "type":"search_files_result","device_id":DEVICE_ID,
+                    "query":query,"entries":[],"error":str(e),
+                }))
+            return
+        elif t == "volume_subscribe":
             flags["volume_subscribed"] = True
             print("[VOLUME] Subscribed — polling active")
             return
