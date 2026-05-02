@@ -374,17 +374,15 @@ def collect_stats() -> dict:
     stats = {
         "device_id": DEVICE_ID, "cpu_percent": None, "cpu_temp": None,
         "ram_used_gb": None, "ram_total_gb": None, "ram_percent": None,
-        "disks": [], "gpu_percent": None, "gpu_temp": None,
+        "disks": [], "gpu_percent": None, "gpu_temp": None, "uptime_seconds": 0,
     }
     if not PSUTIL_AVAILABLE:
         return stats
     try:    stats["cpu_percent"] = psutil.cpu_percent(interval=None)
     except: pass
-    try:
-        temps = psutil.sensors_temperatures()
-        if temps:
-            for _, entries in temps.items():
-                if entries: stats["cpu_temp"] = round(entries[0].current, 1); break
+    try:    stats["cpu_temp"] = get_cpu_temp()
+    except: pass
+    try:    stats["uptime_seconds"] = get_uptime()
     except: pass
     try:
         ram = psutil.virtual_memory()
@@ -430,6 +428,193 @@ def restart_pc() -> bool:
 def lock_pc() -> bool:
     print("[ACTION] Lock")
     return _run_hidden(["rundll32.exe", "user32.dll,LockWorkStation"])
+
+def sleep_pc() -> bool:
+    print("[ACTION] Sleep")
+    if os.name == "nt":
+        return _run_hidden(["rundll32.exe", "powrprof.dll,SetSuspendState", "0", "1", "0"])
+    return False
+
+def get_cpu_temp() -> float | None:
+    """Try to get CPU temperature via multiple methods."""
+    # Method 1: psutil sensors (Linux/Mac, rarely works on Windows)
+    try:
+        temps = psutil.sensors_temperatures()
+        if temps:
+            for key in ["coretemp","k10temp","zenpower","cpu_thermal"]:
+                if key in temps and temps[key]:
+                    return round(temps[key][0].current, 1)
+            # fallback — any first sensor
+            for entries in temps.values():
+                if entries:
+                    return round(entries[0].current, 1)
+    except: pass
+    # Method 2: WMI (Windows — works with Open Hardware Monitor running)
+    if os.name == "nt":
+        try:
+            import wmi as _wmi
+            w = _wmi.WMI(namespace="root\\OpenHardwareMonitor")
+            for s in w.Sensor():
+                if s.SensorType == "Temperature" and "CPU" in s.Name:
+                    return round(float(s.Value), 1)
+        except: pass
+        # Method 3: WMI MSAcpi thermal zone (less accurate but always available)
+        try:
+            import wmi as _wmi
+            w = _wmi.WMI(namespace="root\\WMI")
+            for t in w.MSAcpi_ThermalZoneTemperature():
+                temp_c = (t.CurrentTemperature / 10.0) - 273.15
+                if 0 < temp_c < 120:
+                    return round(temp_c, 1)
+        except: pass
+    return None
+
+def get_uptime() -> int:
+    """Return system uptime in seconds."""
+    try:
+        if PSUTIL_AVAILABLE:
+            return int(time.time() - psutil.boot_time())
+    except: pass
+    return 0
+
+# ─────────────────────────────────────────────
+# Media controls (Windows only)
+# ─────────────────────────────────────────────
+def send_media_key(action: str) -> bool:
+    """Send a media key press using Windows API."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        VK_MAP = {
+            "play_pause": 0xB3,
+            "next":       0xB0,
+            "prev":       0xB1,
+            "stop":       0xB2,
+            "vol_up":     0xAF,
+            "vol_down":   0xAE,
+            "vol_mute":   0xAD,
+        }
+        vk = VK_MAP.get(action)
+        if not vk:
+            return False
+        KEYEVENTF_KEYUP = 0x0002
+        ctypes.windll.user32.keybd_event(vk, 0, 0, 0)
+        ctypes.windll.user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
+        print(f"[MEDIA] {action}")
+        return True
+    except Exception as e:
+        print(f"[MEDIA ERROR] {e}")
+        return False
+
+# ─────────────────────────────────────────────
+# Clipboard
+# ─────────────────────────────────────────────
+def get_clipboard() -> str | None:
+    """Get the current clipboard text content."""
+    try:
+        if os.name == "nt":
+            import ctypes
+            ctypes.windll.user32.OpenClipboard(0)
+            CF_TEXT = 1
+            CF_UNICODETEXT = 13
+            handle = ctypes.windll.user32.GetClipboardData(CF_UNICODETEXT)
+            if not handle:
+                handle = ctypes.windll.user32.GetClipboardData(CF_TEXT)
+            if handle:
+                ptr = ctypes.windll.kernel32.GlobalLock(handle)
+                text = ctypes.wstring_at(ptr)
+                ctypes.windll.kernel32.GlobalUnlock(handle)
+                return text
+        else:
+            import subprocess
+            result = subprocess.run(["pbpaste"], capture_output=True, text=True)
+            return result.stdout
+    except Exception as e:
+        print(f"[CLIPBOARD GET ERROR] {e}")
+    finally:
+        try:
+            if os.name == "nt":
+                import ctypes
+                ctypes.windll.user32.CloseClipboard()
+        except: pass
+    return None
+
+def set_clipboard(text: str) -> bool:
+    """Set the clipboard text content."""
+    try:
+        if os.name == "nt":
+            import ctypes, ctypes.wintypes
+            GMEM_MOVEABLE = 0x0002
+            ctypes.windll.user32.OpenClipboard(0)
+            ctypes.windll.user32.EmptyClipboard()
+            encoded = text.encode("utf-16-le") + b"\x00\x00"
+            handle = ctypes.windll.kernel32.GlobalAlloc(GMEM_MOVEABLE, len(encoded))
+            ptr = ctypes.windll.kernel32.GlobalLock(handle)
+            ctypes.memmove(ptr, encoded, len(encoded))
+            ctypes.windll.kernel32.GlobalUnlock(handle)
+            ctypes.windll.user32.SetClipboardData(13, handle)  # CF_UNICODETEXT
+            ctypes.windll.user32.CloseClipboard()
+            print(f"[CLIPBOARD] Set: {text[:50]}...")
+            return True
+        else:
+            import subprocess
+            subprocess.run(["pbcopy"], input=text.encode(), check=True)
+            return True
+    except Exception as e:
+        print(f"[CLIPBOARD SET ERROR] {e}")
+        return False
+
+# ─────────────────────────────────────────────
+# Type text
+# ─────────────────────────────────────────────
+def type_text(text: str) -> bool:
+    """Type text using Windows SendInput API."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes, ctypes.wintypes
+        # Use clipboard paste for speed and Unicode support
+        original = get_clipboard()
+        set_clipboard(text)
+        # Send Ctrl+V
+        ctypes.windll.user32.keybd_event(0x11, 0, 0, 0)  # Ctrl down
+        ctypes.windll.user32.keybd_event(0x56, 0, 0, 0)  # V down
+        ctypes.windll.user32.keybd_event(0x56, 0, 2, 0)  # V up
+        ctypes.windll.user32.keybd_event(0x11, 0, 2, 0)  # Ctrl up
+        time.sleep(0.1)
+        # Restore original clipboard
+        if original:
+            set_clipboard(original)
+        print(f"[TYPE] Typed: {text[:50]}")
+        return True
+    except Exception as e:
+        print(f"[TYPE ERROR] {e}")
+        return False
+
+# ─────────────────────────────────────────────
+# Screenshot
+# ─────────────────────────────────────────────
+def take_screenshot() -> str | None:
+    """Take a screenshot and return as base64-encoded JPEG."""
+    try:
+        import base64
+        from PIL import ImageGrab
+        img = ImageGrab.grab()
+        # Resize to reasonable size for transfer (max 1920 wide)
+        max_w = 1920
+        if img.width > max_w:
+            ratio = max_w / img.width
+            img = img.resize((max_w, int(img.height * ratio)), Image.LANCZOS)
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=75)
+        buf.seek(0)
+        data = base64.b64encode(buf.read()).decode()
+        print(f"[SCREENSHOT] Captured ({img.width}x{img.height}, {len(data)//1024}KB)")
+        return data
+    except Exception as e:
+        print(f"[SCREENSHOT ERROR] {e}")
+        return None
 
 # ─────────────────────────────────────────────
 # Volume control (Windows only, requires pycaw)
@@ -823,6 +1008,33 @@ async def handle_command(cmd, ws):
             if not restart_pc(): status = "failed"
         elif t == "lock_pc":
             if not lock_pc(): status = "failed"
+        elif t == "sleep_pc":
+            if not sleep_pc(): status = "failed"
+        elif t == "media_control":
+            action = cmd.get("action", "")
+            if not send_media_key(action): status = "failed"
+        elif t == "get_clipboard":
+            text = get_clipboard()
+            await ws.send(json.dumps({
+                "type":"clipboard_data","device_id":DEVICE_ID,"text":text or "",
+            }))
+            return
+        elif t == "set_clipboard":
+            text = cmd.get("text","")
+            if not set_clipboard(text): status = "failed"
+        elif t == "type_text":
+            text = cmd.get("text","")
+            if text:
+                if not type_text(text): status = "failed"
+            else:
+                status = "failed"
+        elif t == "take_screenshot":
+            data = take_screenshot()
+            await ws.send(json.dumps({
+                "type":"screenshot_result","device_id":DEVICE_ID,
+                "data":data,"error":None if data else "Screenshot failed",
+            }))
+            return
         elif t == "wake_pc":
             mac = cmd.get("mac")
             if mac:
