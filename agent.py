@@ -1037,15 +1037,24 @@ async def handle_command(cmd, ws):
         elif t == "media_control":
             action = cmd.get("action", "")
             if not send_media_key(action): status = "failed"
-            # After media key, send back now playing info
-            info = get_now_playing()
-            if info:
-                await ws.send(json.dumps({
-                    "type":"now_playing","device_id":DEVICE_ID,**info
-                }))
+            # Send ack immediately, then fetch now playing in background
+            if cmd_id:
+                await ws.send(json.dumps({"type":"ack","command_id":cmd_id,"status":status}))
+            async def _send_now_playing():
+                await asyncio.sleep(0.6)
+                loop = asyncio.get_event_loop()
+                info = await loop.run_in_executor(None, get_now_playing)
+                if info:
+                    try:
+                        await ws.send(json.dumps({
+                            "type":"now_playing","device_id":DEVICE_ID,**info
+                        }))
+                    except: pass
+            asyncio.create_task(_send_now_playing())
             return
         elif t == "get_now_playing":
-            info = get_now_playing()
+            loop = asyncio.get_event_loop()
+            info = await loop.run_in_executor(None, get_now_playing)
             await ws.send(json.dumps({
                 "type":"now_playing","device_id":DEVICE_ID,
                 **(info or {"title":None,"artist":None,"status":None})
