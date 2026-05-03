@@ -302,16 +302,17 @@ def execute_startup_queue():
 # Flags
 # ─────────────────────────────────────────────
 flags = {
-    "show_qr":             False,
-    "close_popup":         False,
-    "show_unpaired":       False,
-    "tray_unpair":         False,
-    "tray_quit":           False,
-    "tray_restart":        False,
-    "we_initiated_unpair": False,
-    "file_picker_request": None,
-    "volume_subscribed":   False,
-    "update_available":    None,   # set to version string if update found
+    "show_qr":                  False,
+    "close_popup":              False,
+    "show_unpaired":            False,
+    "tray_unpair":              False,
+    "tray_quit":                False,
+    "tray_restart":             False,
+    "we_initiated_unpair":      False,
+    "file_picker_request":      None,
+    "soundboard_picker_request":None,
+    "volume_subscribed":        False,
+    "update_available":         None,
 }
 
 loop_ref      = {"loop": None}
@@ -480,39 +481,248 @@ def get_uptime() -> int:
 # ─────────────────────────────────────────────
 # Media controls (Windows only)
 # ─────────────────────────────────────────────
+_last_known_track = {"title": None, "artist": None, "status": None, "album_art": None}
+
+async def _get_now_playing_async():
+    """Async inner function using winsdk to get media info + album art."""
+    try:
+        from winsdk.windows.media.control import GlobalSystemMediaTransportControlsSessionManager
+        from winsdk.windows.storage.streams import DataReader, Buffer, InputStreamOptions
+        import base64
+
+        manager = await GlobalSystemMediaTransportControlsSessionManager.request_async()
+        session = manager.get_current_session()
+        if not session:
+            return None
+
+        props   = await session.try_get_media_properties_async()
+        playback = session.get_playback_info()
+
+        title  = props.title  or ""
+        artist = props.artist or ""
+        status = str(playback.playback_status).split(".")[-1] if playback else ""
+
+        # Try to get album art thumbnail
+        album_art_b64 = None
+        try:
+            thumb_ref = props.thumbnail
+            if thumb_ref:
+                stream = await thumb_ref.open_read_async()
+                size   = stream.size
+                if size > 0 and size < 500_000:   # skip >500KB
+                    buf = Buffer(int(size))
+                    await stream.read_async(buf, int(size), InputStreamOptions.NONE)
+                    reader = DataReader.from_buffer(buf)
+                    data   = bytearray(int(size))
+                    reader.read_bytes(data)
+                    album_art_b64 = base64.b64encode(bytes(data)).decode()
+        except Exception as e:
+            print(f"[MEDIA ART] {e}")
+
+        return {
+            "title":     title,
+            "artist":    artist,
+            "status":    status,
+            "album_art": album_art_b64,
+        }
+    except Exception as e:
+        print(f"[MEDIA WINSDK ERROR] {e}")
+        return None
+
 def get_now_playing() -> dict | None:
-    """Get currently playing media info from Windows media session API."""
+    """Get currently playing media info including album art via winsdk."""
+    global _last_known_track
     if os.name != "nt":
         return None
     try:
-        import subprocess
-        CREATE_NO_WINDOW = 0x08000000
-        ps_script = """
-try {
-    $sessions = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager,Windows.Media.Control,ContentType=WindowsRuntime]::RequestAsync().GetAwaiter().GetResult()
-    $session = $sessions.GetCurrentSession()
-    if ($session) {
-        $info = $session.TryGetMediaPropertiesAsync().GetAwaiter().GetResult()
-        $status = $session.GetPlaybackInfo().PlaybackStatus
-        Write-Output "$($info.Title)|$($info.Artist)|$status"
-    }
-} catch { Write-Output "||" }
-"""
-        result = subprocess.run(
-            ["powershell", "-command", ps_script],
-            capture_output=True, text=True, encoding="utf-8",
-            creationflags=CREATE_NO_WINDOW, timeout=3
-        )
-        parts = result.stdout.strip().split("|")
-        if len(parts) >= 2 and parts[0]:
-            return {
-                "title":  parts[0],
-                "artist": parts[1] if len(parts)>1 else "",
-                "status": parts[2] if len(parts)>2 else "",
-            }
+        import asyncio
+        # Run async winsdk code in a fresh event loop (called from executor thread)
+        loop = asyncio.new_event_loop()
+        result = loop.run_until_complete(_get_now_playing_async())
+        loop.close()
+
+        if result and result["title"]:
+            # Only send album art when track changes to save bandwidth
+            if (result["title"] != _last_known_track.get("title") or
+                result["artist"] != _last_known_track.get("artist")):
+                track = result
+            else:
+                # Same track — omit album art to save bandwidth
+                track = {**result, "album_art": None, "art_unchanged": True}
+            _last_known_track = result
+            print(f"[MEDIA] {result['title']} — {result['artist']} ({result['status']})")
+            return track
+
+        if _last_known_track["title"]:
+            return {**_last_known_track, "status": "Paused", "is_last_known": True, "album_art": None}
     except Exception as e:
         print(f"[MEDIA INFO ERROR] {e}")
     return None
+
+def get_network_info() -> dict:
+    """Get network adapter stats — current speeds and connection info."""
+    info = { "wifi_name": None, "interface": None, "bytes_sent": 0, "bytes_recv": 0,
+             "upload_mbps": 0.0, "download_mbps": 0.0, "ip": None }
+    if not PSUTIL_AVAILABLE:
+        return info
+    try:
+        # Get WiFi SSID on Windows
+        if os.name == "nt":
+            import subprocess
+            CREATE_NO_WINDOW = 0x08000000
+            r = subprocess.run(
+                ["netsh","wlan","show","interfaces"],
+                capture_output=True, text=True, creationflags=CREATE_NO_WINDOW
+            )
+            for line in r.stdout.splitlines():
+                if "SSID" in line and "BSSID" not in line:
+                    info["wifi_name"] = line.split(":",1)[-1].strip()
+                    break
+
+        # Get IP
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            info["ip"] = s.getsockname()[0]
+        finally:
+            s.close()
+
+        # Sample network bytes over 1 second for speed
+        c1 = psutil.net_io_counters()
+        time.sleep(1)
+        c2 = psutil.net_io_counters()
+        info["upload_mbps"]   = round((c2.bytes_sent - c1.bytes_sent) * 8 / 1_000_000, 2)
+        info["download_mbps"] = round((c2.bytes_recv - c1.bytes_recv) * 8 / 1_000_000, 2)
+        info["bytes_sent"]    = c2.bytes_sent
+        info["bytes_recv"]    = c2.bytes_recv
+    except Exception as e:
+        print(f"[NETWORK ERROR] {e}")
+    return info
+
+def run_speedtest() -> dict:
+    """Run a quick speedtest using speedtest-cli or fallback urllib."""
+    result = { "download_mbps": None, "upload_mbps": None, "ping_ms": None,
+               "server": None, "error": None }
+    try:
+        import subprocess
+        CREATE_NO_WINDOW = 0x08000000
+        # Try speedtest-cli first (pip install speedtest-cli)
+        r = subprocess.run(
+            ["python", "-m", "speedtest", "--json"],
+            capture_output=True, text=True, timeout=60,
+            creationflags=CREATE_NO_WINDOW
+        )
+        if r.returncode == 0:
+            import json as _json
+            data = _json.loads(r.stdout)
+            result["download_mbps"] = round(data["download"] / 1_000_000, 2)
+            result["upload_mbps"]   = round(data["upload"]   / 1_000_000, 2)
+            result["ping_ms"]       = round(data["ping"], 1)
+            result["server"]        = data.get("server",{}).get("name","")
+            return result
+    except: pass
+    result["error"] = "Install speedtest-cli: pip install speedtest-cli"
+    return result
+
+def get_audio_devices() -> dict:
+    """Get available audio output and input devices."""
+    devices = { "outputs": [], "inputs": [] }
+    if os.name != "nt" or not PYCAW_AVAILABLE:
+        return devices
+    try:
+        from pycaw.pycaw import AudioUtilities
+        import pythoncom
+        pythoncom.CoInitialize()
+        # Outputs (render)
+        try:
+            from pycaw.pycaw import IMMDeviceEnumerator, EDataFlow, ERole
+            import comtypes.client
+            enumerator = comtypes.CoCreateInstance(
+                "{BCDE0395-E52F-467C-8E3D-C4579291692E}",
+                None, 1,
+                "{A95664D2-9614-4F35-A746-DE8DB63617E6}"
+            )
+        except: pass
+        # Simpler approach — use sounddevice if available
+        try:
+            import sounddevice as sd
+            for d in sd.query_devices():
+                if d["max_output_channels"] > 0:
+                    devices["outputs"].append({"id":d["index"],"name":d["name"]})
+                if d["max_input_channels"] > 0:
+                    devices["inputs"].append({"id":d["index"],"name":d["name"]})
+            return devices
+        except: pass
+        # Fallback — PowerShell
+        import subprocess
+        CREATE_NO_WINDOW = 0x08000000
+        r = subprocess.run(
+            ["powershell","-command",
+             "Get-AudioDevice -list 2>$null | Select-Object Index,Name,Type | ConvertTo-Json"],
+            capture_output=True, text=True, creationflags=CREATE_NO_WINDOW, timeout=5
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            import json as _json
+            items = _json.loads(r.stdout)
+            if isinstance(items, dict): items = [items]
+            for item in items:
+                entry = {"id": item.get("Index",0), "name": item.get("Name","")}
+                if item.get("Type") == "Playback": devices["outputs"].append(entry)
+                elif item.get("Type") == "Recording": devices["inputs"].append(entry)
+    except Exception as e:
+        print(f"[AUDIO DEVICES ERROR] {e}")
+    finally:
+        try:
+            import pythoncom; pythoncom.CoUninitialize()
+        except: pass
+    return devices
+
+def play_sound(file_path: str, device_id: int = -1) -> bool:
+    """Play a sound file through a specific audio device."""
+    try:
+        import subprocess
+        CREATE_NO_WINDOW = 0x08000000
+        # Try sounddevice + soundfile for device routing
+        try:
+            import sounddevice as sd
+            import soundfile as sf
+            data, samplerate = sf.read(file_path)
+            sd.play(data, samplerate, device=device_id if device_id >= 0 else None)
+            sd.wait()
+            print(f"[SOUND] Played: {file_path} on device {device_id}")
+            return True
+        except ImportError:
+            pass
+        # Fallback — PowerShell for default device
+        ps = f"(New-Object Media.SoundPlayer '{file_path}').PlaySync()"
+        subprocess.run(
+            ["powershell", "-command", ps],
+            creationflags=CREATE_NO_WINDOW, timeout=30
+        )
+        print(f"[SOUND] Played (PS): {file_path}")
+        return True
+    except Exception as e:
+        print(f"[SOUND ERROR] {e}")
+        return False
+
+def receive_upload(file_name: str, data_b64: str, dest_folder: str) -> dict:
+    """Save an uploaded file from phone to PC."""
+    try:
+        import base64
+        os.makedirs(dest_folder, exist_ok=True)
+        dest_path = os.path.join(dest_folder, file_name)
+        # If file exists, add suffix
+        if os.path.exists(dest_path):
+            name, ext = os.path.splitext(file_name)
+            dest_path = os.path.join(dest_folder, f"{name}_{int(time.time())}{ext}")
+        data = base64.b64decode(data_b64)
+        with open(dest_path, "wb") as f:
+            f.write(data)
+        print(f"[UPLOAD] Saved: {dest_path} ({len(data)//1024}KB)")
+        return {"success": True, "path": dest_path}
+    except Exception as e:
+        print(f"[UPLOAD ERROR] {e}")
+        return {"success": False, "error": str(e)}
     """Send a media key press using Windows API."""
     if os.name != "nt":
         return False
@@ -546,21 +756,30 @@ def get_clipboard() -> str | None:
     """Get the current clipboard text content."""
     try:
         if os.name == "nt":
-            import subprocess
+            import subprocess, tempfile
             CREATE_NO_WINDOW = 0x08000000
-            result = subprocess.run(
-                ["powershell", "-command", "Get-Clipboard"],
-                capture_output=True, text=True, encoding="utf-8",
-                creationflags=CREATE_NO_WINDOW
+            tmp = tempfile.mktemp(suffix=".txt")
+            subprocess.run(
+                ["powershell", "-command",
+                 f"[System.IO.File]::WriteAllText('{tmp}', (Get-Clipboard -Raw), [System.Text.Encoding]::UTF8)"],
+                creationflags=CREATE_NO_WINDOW, capture_output=True, timeout=5
             )
-            return result.stdout.rstrip("\n")
+            if os.path.exists(tmp):
+                with open(tmp, "r", encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+                try: os.remove(tmp)
+                except: pass
+                text = text.rstrip("\n")
+                if len(text) > 10000:
+                    text = text[:10000] + f"\n\n[Truncated — {len(text)} chars total]"
+                return text
         else:
             import subprocess
             result = subprocess.run(["pbpaste"], capture_output=True, text=True)
             return result.stdout
     except Exception as e:
         print(f"[CLIPBOARD GET ERROR] {e}")
-        return None
+    return None
 
 def set_clipboard(text: str) -> bool:
     """Set the clipboard text content."""
@@ -1061,18 +1280,26 @@ async def handle_command(cmd, ws):
             }))
             return
         elif t == "get_clipboard":
-            text = get_clipboard()
+            print("[CLIPBOARD] Fetching...")
+            loop = asyncio.get_event_loop()
+            text = await loop.run_in_executor(None, get_clipboard)
+            print(f"[CLIPBOARD] Got {len(text) if text else 0} chars")
             await ws.send(json.dumps({
                 "type":"clipboard_data","device_id":DEVICE_ID,"text":text or "",
             }))
+            print("[CLIPBOARD] Sent")
             return
         elif t == "set_clipboard":
             text = cmd.get("text","")
-            if not set_clipboard(text): status = "failed"
+            loop = asyncio.get_event_loop()
+            ok = await loop.run_in_executor(None, lambda: set_clipboard(text))
+            if not ok: status = "failed"
         elif t == "type_text":
             text = cmd.get("text","")
             if text:
-                if not type_text(text): status = "failed"
+                loop = asyncio.get_event_loop()
+                ok = await loop.run_in_executor(None, lambda: type_text(text))
+                if not ok: status = "failed"
             else:
                 status = "failed"
         elif t == "take_screenshot":
@@ -1248,7 +1475,57 @@ async def handle_command(cmd, ws):
                     "query":query,"entries":[],"error":str(e),
                 }))
             return
-        elif t == "volume_subscribe":
+        elif t == "get_network_info":
+            loop = asyncio.get_event_loop()
+            info = await loop.run_in_executor(None, get_network_info)
+            await ws.send(json.dumps({
+                "type":"network_info","device_id":DEVICE_ID,**info
+            }))
+            return
+        elif t == "run_speedtest":
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, run_speedtest)
+            await ws.send(json.dumps({
+                "type":"speedtest_result","device_id":DEVICE_ID,**result
+            }))
+            return
+        elif t == "get_audio_devices":
+            loop = asyncio.get_event_loop()
+            devices = await loop.run_in_executor(None, get_audio_devices)
+            await ws.send(json.dumps({
+                "type":"audio_devices","device_id":DEVICE_ID,**devices
+            }))
+            return
+        elif t == "play_sound":
+            file_path = cmd.get("path","")
+            device_id = cmd.get("device_id", -1)
+            if file_path:
+                loop = asyncio.get_event_loop()
+                ok = await loop.run_in_executor(None, lambda: play_sound(file_path, device_id))
+                if not ok: status = "failed"
+            else:
+                status = "failed"
+        elif t == "upload_file":
+            file_name   = cmd.get("name","upload")
+            data_b64    = cmd.get("data","")
+            dest_folder = cmd.get("dest_folder","")
+            if not dest_folder:
+                import pathlib
+                dest_folder = str(pathlib.Path.home() / "Downloads")
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, lambda: receive_upload(file_name, data_b64, dest_folder))
+            await ws.send(json.dumps({
+                "type":"upload_result","device_id":DEVICE_ID,**result
+            }))
+            return
+        elif t == "browse_soundboard_files":
+            # Open Windows file picker for sound files
+            request_id = cmd.get("request_id", str(uuid.uuid4()))
+            flags["soundboard_picker_request"] = {
+                "request_id": request_id,
+                "filter": [("Audio Files","*.mp3 *.wav *.ogg *.flac *.m4a *.aac"),("All Files","*.*")]
+            }
+            return
             flags["volume_subscribed"] = True
             print("[VOLUME] Subscribed — polling active")
             return
@@ -1408,7 +1685,29 @@ def start_tray():
 # ─────────────────────────────────────────────
 # File picker — must run on main thread (tkinter requirement)
 # ─────────────────────────────────────────────
-def handle_file_picker_request(request_id: str):
+def handle_soundboard_picker_request(request_id: str, file_filter: list):
+    """Opens a Windows file dialog for audio files and sends path back."""
+    try:
+        root = tk.Tk(); root.withdraw()
+        root.attributes("-topmost", True); root.lift(); root.focus_force(); root.update()
+        root.after(200, lambda: root.attributes("-topmost", False))
+        path = filedialog.askopenfilename(
+            title="Select Sound File — PCLink Soundboard",
+            filetypes=file_filter or [("Audio Files","*.mp3 *.wav *.ogg *.flac *.m4a"),("All Files","*.*")],
+            parent=root,
+        )
+        root.destroy()
+        result = path if path else None
+        print(f"[SOUNDBOARD PICKER] Selected: {result}")
+    except Exception as e:
+        print(f"[SOUNDBOARD PICKER ERROR] {e}"); result = None
+    threadsafe_send({
+        "type": "soundboard_file_result",
+        "request_id": request_id,
+        "path": result,
+        "name": os.path.basename(result) if result else None,
+        "device_id": DEVICE_ID,
+    })
     """Opens a Windows file dialog and sends the selected path back via WebSocket."""
     try:
         root = tk.Tk()
@@ -1766,6 +2065,10 @@ if __name__ == "__main__":
         if fp:
             flags["file_picker_request"] = None
             handle_file_picker_request(fp["request_id"])
+        sp = flags.get("soundboard_picker_request")
+        if sp:
+            flags["soundboard_picker_request"] = None
+            handle_soundboard_picker_request(sp["request_id"], sp.get("filter",[]))
         update_ver = flags.get("update_available")
         if update_ver:
             flags["update_available"] = None

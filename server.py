@@ -502,15 +502,18 @@ async def handler(ws):
             # ── STANDARD COMMANDS ──
             elif msg_type in ["shutdown_pc", "restart_pc", "lock_pc", "sleep_pc",
                                "media_control", "set_clipboard", "type_text",
-                               "take_screenshot", "get_clipboard", "get_now_playing"]:
+                               "take_screenshot", "get_clipboard", "get_now_playing",
+                               "get_network_info", "run_speedtest", "get_audio_devices",
+                               "play_sound", "upload_file", "browse_soundboard_files"]:
                 target_id = data.get("device_id"); token = data.get("token", "")
                 if not target_id: continue
                 if target_id in device_tokens and not validate_token(target_id, token):
                     await reject_token(ws, target_id); continue
                 await send_to_device(target_id, {k:v for k,v in data.items() if k!="token"}, origin_ws=ws)
 
-            # ── CLIPBOARD / SCREENSHOT / NOW PLAYING RESULTS: AGENT → MOBILE ──
-            elif msg_type in ["clipboard_data", "screenshot_result", "now_playing"]:
+            elif msg_type in ["clipboard_data", "screenshot_result", "now_playing",
+                               "network_info", "speedtest_result", "audio_devices",
+                               "upload_result", "soundboard_file_result"]:
                 await broadcast_to_mobile(data)
 
             elif msg_type == "wake_pc":
